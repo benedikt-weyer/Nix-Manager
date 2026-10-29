@@ -41,6 +41,17 @@ service NixBackend {
     // The packages the target's NixOS configuration installs: system
     // packages, per-user packages and (when used) home-manager packages.
     rpc ListInstalledPackages(ListInstalledRequest) returns (ListInstalledReply);
+
+    // The files in the config directory that Nix Manager writes packages
+    // into. The default one is always listed, whether or not it exists yet.
+    rpc ListDestinations(ListDestinationsRequest) returns (ListDestinationsReply);
+
+    // Creates another such file.
+    rpc CreateDestination(CreateDestinationRequest) returns (Destination);
+
+    // Adds a package to, or removes it from, one of those files. Adding to a
+    // default destination that doesn't exist yet creates it.
+    rpc SetConfigPackage(SetConfigPackageRequest) returns (SetConfigPackageReply);
 }
 
 // Only one UpdateFlake/Rebuild runs at a time per backend. Starting another
@@ -247,4 +258,54 @@ message ListInstalledRequest {
 message ListInstalledReply {
     // Sorted by name, without duplicates.
     repeated Package packages = 1;
+}
+
+// A NixOS module in the config directory, `nix-manager-<name>.nix`, whose
+// `environment.systemPackages` Nix Manager maintains. Only the lines between
+// its marker comments are touched; the rest of the file belongs to the user.
+message Destination {
+    // File name inside the config directory, e.g. "nix-manager-config.nix".
+    string file = 1;
+    // Where it is (or would be) on disk.
+    string path = 2;
+    bool exists = 3;
+    // The one packages go to unless another is chosen.
+    bool is_default = 4;
+    // Whether another .nix file in the config directory mentions this one, which
+    // is how an import shows up. A guess: nix itself is not asked.
+    bool imported = 5;
+    // Nixpkgs attributes listed in it, e.g. "hello" or "kdePackages.kate".
+    repeated string packages = 6;
+}
+
+message ListDestinationsRequest {
+    SystemTarget target = 1;
+}
+
+message ListDestinationsReply {
+    // The default first, then the rest by name.
+    repeated Destination destinations = 1;
+}
+
+message CreateDestinationRequest {
+    SystemTarget target = 1;
+    // A short name such as "gaming"; it becomes "nix-manager-gaming.nix".
+    string name = 2;
+}
+
+message SetConfigPackageRequest {
+    SystemTarget target = 1;
+    // A destination's file name.
+    string file = 2;
+    // A nixpkgs attribute.
+    string attr = 3;
+    // true adds the package, false removes it.
+    bool present = 4;
+}
+
+message SetConfigPackageReply {
+    Destination destination = 1;
+    // The file was new to git, and was staged so that flakes can see it
+    // (a flake only reads files git knows about).
+    bool staged_in_git = 2;
 }

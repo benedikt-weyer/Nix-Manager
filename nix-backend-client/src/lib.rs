@@ -21,14 +21,15 @@ pub mod proto {
 }
 
 pub use proto::{
-    BuildItem, BuildItemKind, BuildItemStatus, BuildStats, EventPhase, FlakeStatusReply, Maintainer, OperationEvent,
-    OperationKind, Package, PackageSummary, ProgressEvent, RebuildMode, SearchPackagesReply, SystemTarget,
+    BuildItem, BuildItemKind, BuildItemStatus, BuildStats, Destination, EventPhase, FlakeStatusReply, Maintainer,
+    OperationEvent, OperationKind, Package, PackageSummary, ProgressEvent, RebuildMode, SearchPackagesReply,
+    SetConfigPackageReply, SystemTarget,
 };
 
 use proto::nix_backend_client::NixBackendClient;
 use proto::{
-    FlakeStatusRequest, GetPackageRequest, ListInstalledRequest, RebuildRequest, SearchPackagesRequest,
-    UpdateFlakeRequest, WatchRequest,
+    CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest, ListDestinationsRequest, ListInstalledRequest,
+    RebuildRequest, SearchPackagesRequest, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +109,31 @@ impl Client {
     pub async fn list_installed_packages(&mut self, target: SystemTarget) -> Result<Vec<Package>, Status> {
         let reply = self.inner.list_installed_packages(ListInstalledRequest { target: Some(target) }).await?;
         Ok(reply.into_inner().packages)
+    }
+
+    /// The files packages are added to: the default first, then the others.
+    pub async fn list_destinations(&mut self, target: SystemTarget) -> Result<Vec<Destination>, Status> {
+        let reply = self.inner.list_destinations(ListDestinationsRequest { target: Some(target) }).await?;
+        Ok(reply.into_inner().destinations)
+    }
+
+    /// Creates `nix-manager-<name>.nix`, or returns it if it is already there.
+    pub async fn create_destination(&mut self, target: SystemTarget, name: String) -> Result<Destination, Status> {
+        let request = CreateDestinationRequest { target: Some(target), name };
+        Ok(self.inner.create_destination(request).await?.into_inner())
+    }
+
+    /// Adds `attr` to, or (`present` false) removes it from, the destination
+    /// `file`. Adding to the default destination creates it if need be.
+    pub async fn set_config_package(
+        &mut self,
+        target: SystemTarget,
+        file: String,
+        attr: String,
+        present: bool,
+    ) -> Result<SetConfigPackageReply, Status> {
+        let request = SetConfigPackageRequest { target: Some(target), file, attr, present };
+        Ok(self.inner.set_config_package(request).await?.into_inner())
     }
 
     /// Every event of every operation, whoever started it. Frontends should

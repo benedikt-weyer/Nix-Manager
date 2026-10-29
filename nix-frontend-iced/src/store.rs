@@ -1,14 +1,15 @@
 //! The store page: browse and search the packages the flake's nixpkgs offers,
-//! see what is installed, and read about any one of them.
+//! see what is installed, read about any one of them, and add them to the
+//! configuration.
 
 use std::collections::HashSet;
 
-use iced::widget::{button, column, container, row, space, text, text::Wrapping, text_input, Text};
+use iced::widget::{button, column, container, pick_list, row, space, text, text::Wrapping, text_input, Text};
 use iced::{Alignment, Background, Border, Color, Element, Font, Length};
 use iced_fonts::lucide;
-use nix_backend_client::{Maintainer, Package, SearchPackagesReply};
+use nix_backend_client::{Destination, Maintainer, Package, SearchPackagesReply};
 
-use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEXT};
+use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEXT, WARNING};
 use crate::view::{bar, centered_icon, copy_button, ghost_button, icon_tile, BOLD};
 use crate::{App, Conn, CopyTarget, Message};
 
@@ -50,6 +51,46 @@ impl<T> Load<T> {
     }
 }
 
+/// The file packages go to unless another is picked.
+pub const DEFAULT_DESTINATION: &str = "nix-manager-config.nix";
+
+/// Text the setup guide offers to copy.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Snippet {
+    /// The import line, for `configuration.nix`.
+    Imports,
+    /// The same line, for a flake's `modules` list.
+    Modules,
+    GitAdd,
+}
+
+pub fn snippet(kind: Snippet, file: &str, host: &str) -> String {
+    match kind {
+        Snippet::Imports => format!(
+            "{{ config, pkgs, ... }}:\n{{\n  imports = [\n    ./hardware-configuration.nix\n    ./{file}   # <- add this line\n  ];\n\n  # ... the rest of your configuration\n}}"
+        ),
+        Snippet::Modules => format!(
+            "nixosConfigurations.{host} = nixpkgs.lib.nixosSystem {{\n  modules = [\n    ./configuration.nix\n    ./{file}   # <- add this line\n  ];\n}};"
+        ),
+        Snippet::GitAdd => format!("git add {file}"),
+    }
+}
+
+/// What a change to the configuration led to, shown above the page.
+pub struct Banner {
+    pub text: String,
+    pub error: bool,
+    pub action: Option<BannerAction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BannerAction {
+    /// To the dashboard, to rebuild.
+    Rebuild,
+    /// To the setup guide.
+    Guide,
+}
+
 /// The package whose page is open.
 pub struct Detail {
     /// What to call it while its details are still on their way.
@@ -74,6 +115,16 @@ pub struct Store {
     /// What the filter box on the installed tab says.
     pub filter: String,
     pub detail: Option<Detail>,
+    pub destinations: Load<Vec<Destination>>,
+    /// The file name packages are added to.
+    pub destination: String,
+    /// The name being typed for a new destination, while that form is open.
+    pub naming: Option<String>,
+    /// Whether the setup guide is showing.
+    pub guide: bool,
+    pub banner: Option<Banner>,
+    /// A change to the configuration is on its way.
+    pub changing: bool,
 }
 
 impl Store {
@@ -88,6 +139,12 @@ impl Store {
             installed_names: HashSet::new(),
             filter: String::new(),
             detail: None,
+            destinations: Load::Idle,
+            destination: DEFAULT_DESTINATION.to_owned(),
+            naming: None,
+            guide: false,
+            banner: None,
+            changing: false,
         }
     }
 
@@ -107,6 +164,48 @@ impl Store {
 
     pub fn is_installed(&self, pname: &str) -> bool {
         self.installed_names.contains(pname)
+    }
+
+    pub fn set_destinations(&mut self, result: Result<Vec<Destination>, String>) {
+        if let Ok(destinations) = &result {
+            if !destinations.iter().any(|d| d.file == self.destination) {
+                self.destination = DEFAULT_DESTINATION.to_owned();
+            }
+        }
+        self.destinations = Load::from_result(result);
+    }
+
+    /// Takes in a destination the backend just changed or created.
+    pub fn put_destination(&mut self, destination: Destination) {
+        let mut all = match std::mem::replace(&mut self.destinations, Load::Idle) {
+            Load::Ready(all) => all,
+            _ => Vec::new(),
+        };
+        match all.iter_mut().find(|d| d.file == destination.file) {
+            Some(existing) => *existing = destination,
+            None => {
+                all.push(destination);
+                all.sort_by(|a, b| b.is_default.cmp(&a.is_default).then_with(|| a.file.cmp(&b.file)));
+            }
+        }
+        self.destinations = Load::Ready(all);
+    }
+
+    fn files(&self) -> Vec<String> {
+        match self.destinations.ready() {
+            Some(all) if !all.is_empty() => all.iter().map(|d| d.file.clone()).collect(),
+            _ => vec![DEFAULT_DESTINATION.to_owned()],
+        }
+    }
+
+    /// The destination packages currently go to, if the backend has listed it.
+    pub fn selected(&self) -> Option<&Destination> {
+        self.destinations.ready()?.iter().find(|d| d.file == self.destination)
+    }
+
+    /// The destination that lists `attr`, if any.
+    pub fn configured(&self, attr: &str) -> Option<&Destination> {
+        self.destinations.ready()?.iter().find(|d| d.packages.iter().any(|p| p == attr))
     }
 
     /// Whether anything on this page is waiting for the backend.
@@ -137,9 +236,17 @@ impl Store {
 // ------------------------------------------------------------------ views --
 
 pub fn page(app: &App) -> Element<'_, Message> {
-    match &app.store.detail {
-        Some(detail) => detail_page(app, detail),
-        None => list_page(app),
+    let body = if app.store.guide {
+        guide_page(app)
+    } else {
+        match &app.store.detail {
+            Some(detail) => detail_page(app, detail),
+            None => list_page(app),
+        }
+    };
+    match &app.store.banner {
+        Some(banner) => column![banner_view(banner), body].spacing(16).into(),
+        None => body,
     }
 }
 
@@ -160,6 +267,15 @@ fn list_page(app: &App) -> Element<'_, Message> {
         ),
     ]
     .spacing(6);
+    let tabs = row![
+        tabs,
+        space::horizontal(),
+        button(row![lucide::book_open().size(13), text("Setup guide").size(13)].spacing(8).align_y(Alignment::Center))
+            .padding([8, 14])
+            .style(ghost_button)
+            .on_press(Message::OpenGuide),
+    ]
+    .align_y(Alignment::Center);
 
     let online = matches!(app.conn, Conn::Online(_));
     let search: Element<_> = match store.tab {
@@ -204,7 +320,11 @@ fn list_page(app: &App) -> Element<'_, Message> {
         }
     };
 
-    column![tabs, search, body].spacing(16).into()
+    let mut page = column![tabs, search].spacing(16);
+    if online && store.tab == Tab::Browse {
+        page = page.push(destination_bar(app));
+    }
+    page.push(body).into()
 }
 
 fn browse_body(app: &App) -> Element<'_, Message> {
@@ -249,6 +369,7 @@ fn browse_body(app: &App) -> Element<'_, Message> {
                     package.version.clone(),
                     package.description.clone(),
                     store.is_installed(&package.pname),
+                    add_action(app, &package.attr),
                     Message::OpenResult(index),
                 ));
             }
@@ -292,6 +413,7 @@ fn installed_body(app: &App) -> Element<'_, Message> {
                     package.version.clone(),
                     package.description.clone(),
                     false,
+                    space::horizontal().width(0).into(),
                     Message::OpenInstalled(*index),
                 ));
             }
@@ -353,6 +475,9 @@ fn detail_page<'a>(app: &'a App, detail: &'a Detail) -> Element<'a, Message> {
     }
 
     let mut sections = column![card_with(head.into(), 24)].spacing(16);
+    if !detail.attr.is_empty() {
+        sections = sections.push(config_card(app, &detail.attr));
+    }
     if let Some(about) = package.map(|p| p.long_description.trim()).filter(|d| !d.is_empty()) {
         sections = sections.push(card_with(
             column![text("About").size(13).color(MUTED).font(BOLD), text(about.to_owned()).size(14)].spacing(10).into(),
@@ -479,6 +604,7 @@ fn entry<'a>(
     version: String,
     description: String,
     installed: bool,
+    action: Element<'a, Message>,
     on_press: Message,
 ) -> Element<'a, Message> {
     let mut name = row![text(title).size(15).font(BOLD)].spacing(8).align_y(Alignment::Center);
@@ -489,21 +615,27 @@ fn entry<'a>(
         name = name.push(installed_chip());
     }
 
-    button(
-        row![
-            icon_tile(lucide::package(), ACCENT_ALT, 16.0, 36.0, 0.0),
-            column![name, text(description).size(13).color(MUTED).wrapping(Wrapping::None)]
-                .spacing(2)
-                .width(Length::Fill),
-            lucide::chevron_right().size(14).color(MUTED),
-        ]
-        .spacing(14)
-        .align_y(Alignment::Center),
-    )
-    .padding([10, 12])
-    .width(Length::Fill)
-    .style(entry_style)
-    .on_press(on_press)
+    row![
+        button(
+            row![
+                icon_tile(lucide::package(), ACCENT_ALT, 16.0, 36.0, 0.0),
+                column![name, text(description).size(13).color(MUTED).wrapping(Wrapping::None)]
+                    .spacing(2)
+                    .width(Length::Fill),
+                lucide::chevron_right().size(14).color(MUTED),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center),
+        )
+        .padding([10, 12])
+        .width(Length::Fill)
+        .style(entry_style)
+        .on_press(on_press),
+        action,
+    ]
+    .spacing(6)
+    .padding([0, 6])
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -601,4 +733,359 @@ fn working<'a>(fx: &crate::fx::Fx, title: String, detail: &str) -> Element<'a, M
         .into(),
         22,
     )
+}
+
+// ------------------------------------------------------ adding to the config --
+
+/// What a search result offers: add it, or note that it is in the config.
+fn add_action<'a>(app: &App, attr: &str) -> Element<'a, Message> {
+    let store = &app.store;
+    if store.configured(attr).is_some() {
+        return container(
+            row![lucide::check().size(12).color(SUCCESS), text("Added").size(12).color(SUCCESS)]
+                .spacing(5)
+                .align_y(Alignment::Center),
+        )
+        .padding([5, 10])
+        .style(theme::chip(SUCCESS))
+        .into();
+    }
+    let can_add = matches!(app.conn, Conn::Online(_)) && !store.changing;
+    button(row![lucide::plus().size(13), text("Add").size(13)].spacing(6).align_y(Alignment::Center))
+        .padding([6, 12])
+        .style(ghost_button)
+        .on_press_maybe(can_add.then(|| Message::AddPackage(attr.to_owned())))
+        .into()
+}
+
+fn destination_picker<'a>(store: &Store) -> Element<'a, Message> {
+    let files = store.files();
+    let selected = files.iter().find(|file| **file == store.destination).cloned();
+    pick_list(files, selected, Message::SelectDestination).text_size(13).padding([6, 10]).into()
+}
+
+/// Where packages will be added, and the state of that file.
+fn destination_bar(app: &App) -> Element<'_, Message> {
+    let store = &app.store;
+
+    let status: Element<_> = match store.selected() {
+        Some(d) if d.exists && d.imported => status_chip(lucide::circle_check(), "imported", SUCCESS),
+        Some(d) if d.exists => status_chip(lucide::triangle_alert(), "not imported yet", WARNING),
+        Some(_) => status_chip(lucide::file_plus(), "created on first add", MUTED),
+        None => space::horizontal().width(0).into(),
+    };
+
+    let mut bar = column![row![
+        lucide::file_plus().size(14).color(MUTED),
+        text("Add to").size(13).color(MUTED),
+        destination_picker(store),
+        button(row![lucide::plus().size(12), text("New file").size(12)].spacing(6).align_y(Alignment::Center))
+            .padding([5, 10])
+            .style(ghost_button)
+            .on_press(Message::NewDestination),
+        space::horizontal(),
+        status,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)]
+    .spacing(10);
+
+    if let Some(name) = &store.naming {
+        let can_create = !name.trim().is_empty() && !store.changing;
+        bar = bar.push(
+            row![
+                text_input("A name, e.g. gaming", name)
+                    .on_input(Message::NewDestinationName)
+                    .on_submit_maybe(can_create.then_some(Message::CreateDestination))
+                    .padding(8)
+                    .size(13)
+                    .style(theme::input),
+                text(format!("→ nix-manager-{}.nix", slug(name))).size(12).font(Font::MONOSPACE).color(MUTED),
+                button(text("Create").size(13))
+                    .padding([7, 14])
+                    .style(theme::primary_button)
+                    .on_press_maybe(can_create.then_some(Message::CreateDestination)),
+                button(text("Cancel").size(13)).padding([7, 12]).style(ghost_button).on_press(Message::NewDestination),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    if store.selected().is_some_and(|d| d.exists && !d.imported) {
+        bar = bar.push(
+            row![
+                lucide::triangle_alert().size(14).color(WARNING),
+                text(format!(
+                    "{} isn't imported by your configuration yet, so packages added to it won't be installed.",
+                    store.destination
+                ))
+                .size(13)
+                .width(Length::Fill),
+                button(text("Show me how").size(13)).padding([5, 12]).style(ghost_button).on_press(Message::OpenGuide),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    container(bar).padding([12, 16]).width(Length::Fill).style(theme::card).into()
+}
+
+/// What `nix-manager-<this>.nix` will be called for what is typed.
+fn slug(name: &str) -> String {
+    let name = name.trim().to_lowercase();
+    let name = name.strip_suffix(".nix").unwrap_or(&name);
+    let name = name.strip_prefix("nix-manager-").unwrap_or(name);
+    if name.is_empty() {
+        "…".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+fn status_chip<'a>(icon: Text<'a>, label: &'static str, tint: Color) -> Element<'a, Message> {
+    container(row![icon.size(12).color(tint), text(label).size(12).color(tint)].spacing(6).align_y(Alignment::Center))
+        .padding([4, 10])
+        .style(theme::chip(tint))
+        .into()
+}
+
+/// On a package's page: put it in the configuration, or take it out.
+fn config_card<'a>(app: &'a App, attr: &'a str) -> Element<'a, Message> {
+    let store = &app.store;
+    let can_change = matches!(app.conn, Conn::Online(_)) && !store.changing;
+
+    let body: Element<_> = match store.configured(attr) {
+        Some(destination) => row![
+            column![
+                row![lucide::circle_check().size(15).color(SUCCESS), text("In your configuration").size(15).font(BOLD)]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                text(format!("Listed in {}. Rebuild to install it.", destination.file)).size(13).color(MUTED),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            button(
+                row![lucide::trash().size(13), text(format!("Remove from {}", destination.file)).size(13)]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+            )
+            .padding([8, 14])
+            .style(ghost_button)
+            .on_press_maybe(can_change.then(|| Message::RemovePackage(attr.to_owned()))),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center)
+        .into(),
+        None => {
+            let target = store.selected().map_or_else(|| store.destination.clone(), |d| d.path.clone());
+            row![
+                column![
+                    text("Install it").size(15).font(BOLD),
+                    text(format!("Writes pkgs.{attr} into {target}. Rebuild afterwards to install it."))
+                        .size(13)
+                        .color(MUTED),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                destination_picker(store),
+                button(
+                    row![lucide::plus().size(14), text("Add to config").size(14)].spacing(8).align_y(Alignment::Center)
+                )
+                .padding([9, 16])
+                .style(theme::primary_button)
+                .on_press_maybe(can_change.then(|| Message::AddPackage(attr.to_owned()))),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center)
+            .into()
+        }
+    };
+    card_with(body, 20)
+}
+
+fn banner_view(banner: &Banner) -> Element<'_, Message> {
+    let (icon, tint) = if banner.error { (lucide::circle_x(), DANGER) } else { (lucide::circle_check(), SUCCESS) };
+    let mut content = row![icon.size(16).color(tint), text(banner.text.clone()).size(13).width(Length::Fill)]
+        .spacing(12)
+        .align_y(Alignment::Center);
+    match banner.action {
+        Some(BannerAction::Rebuild) => {
+            content = content.push(
+                button(text("Go to dashboard").size(13))
+                    .padding([5, 12])
+                    .style(ghost_button)
+                    .on_press(Message::GoToDashboard),
+            );
+        }
+        Some(BannerAction::Guide) => {
+            content = content.push(
+                button(text("Show me how").size(13)).padding([5, 12]).style(ghost_button).on_press(Message::OpenGuide),
+            );
+        }
+        None => {}
+    }
+    content = content.push(
+        button(lucide::x().size(14).color(MUTED)).padding(6).style(ghost_button).on_press(Message::DismissBanner),
+    );
+    container(content).padding([10, 16]).width(Length::Fill).style(theme::chip(tint)).into()
+}
+
+// ------------------------------------------------------------------ guide --
+
+fn guide_page(app: &App) -> Element<'_, Message> {
+    let store = &app.store;
+    let file = store.destination.as_str();
+    let host = app.effective_host_name();
+
+    let status: Element<_> = match store.selected() {
+        Some(d) if d.exists && d.imported => status_chip(lucide::circle_check(), "imported", SUCCESS),
+        Some(d) if d.exists => status_chip(lucide::triangle_alert(), "not imported yet", WARNING),
+        _ => status_chip(lucide::file_plus(), "not created yet", MUTED),
+    };
+
+    let head = row![
+        icon_tile(lucide::book_open(), ACCENT, 22.0, 46.0, 0.4),
+        column![
+            text("Use your packages file").size(22).font(BOLD),
+            text(format!("Make {file} part of your NixOS configuration.")).size(14).color(MUTED),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        status,
+        button(row![lucide::refresh_cw().size(13), text("Check again").size(13)].spacing(8).align_y(Alignment::Center))
+            .padding([8, 14])
+            .style(ghost_button)
+            .on_press(Message::ReloadDestinations),
+    ]
+    .spacing(16)
+    .align_y(Alignment::Center);
+
+    let intro = text(format!(
+        "Packages you add in the store are written to {file} in your configuration directory. NixOS only reads \
+         files that something imports, so the file has to be hooked in once. After that, adding a package is just \
+         a click and a rebuild."
+    ))
+    .size(14);
+
+    let imports = step(
+        1,
+        "Import the file",
+        column![
+            text("Add it to the imports of your configuration. Use whichever matches how your setup is organised.")
+                .size(14),
+            caption("In configuration.nix — the usual place"),
+            code(app, Snippet::Imports, file, host),
+            text(format!("If configuration.nix sits in a subfolder, adjust the path, e.g. ../{file}."))
+                .size(13)
+                .color(MUTED),
+            caption("In flake.nix — if your flake lists its modules itself"),
+            code(app, Snippet::Modules, file, host),
+        ]
+        .spacing(10)
+        .into(),
+    );
+
+    let git = step(
+        2,
+        "Let git see the file",
+        column![
+            text(
+                "A flake only reads files that git tracks. Nix Manager stages the file for you when it creates it \
+                 inside a git repository. If you created or moved it yourself, run this in your configuration \
+                 directory:"
+            )
+            .size(14),
+            code(app, Snippet::GitAdd, file, host),
+            text("Commit it together with the rest of your configuration when you are happy with it.")
+                .size(13)
+                .color(MUTED),
+        ]
+        .spacing(10)
+        .into(),
+    );
+
+    let rebuild = step(
+        3,
+        "Rebuild",
+        text(
+            "Back on the dashboard, run Build to check that everything evaluates, then Switch to install. \
+             Afterwards the packages show up under Installed. Adding or removing more packages always needs \
+             another rebuild.",
+        )
+        .size(14)
+        .into(),
+    );
+
+    let notes = step(
+        4,
+        "Good to know",
+        column![
+            bullet(format!(
+                "Only the lines between the `nix-manager:begin` and `nix-manager:end` comments in {file} are managed. \
+                 Anything else you write in the file is left alone."
+            )),
+            bullet(
+                "Use New file on the Browse tab to keep packages apart, for example gaming or work. Each file \
+                 needs its own import line, exactly as above."
+                    .to_owned()
+            ),
+            bullet("Packages go into environment.systemPackages, so they are installed for every user.".to_owned()),
+            bullet(
+                "Nix Manager must be able to write to the configuration directory. If it can't, make the directory \
+                 yours (sudo chown -R $USER <directory>) or point Nix Manager at a copy you own in Settings."
+                    .to_owned()
+            ),
+        ]
+        .spacing(8)
+        .into(),
+    );
+
+    column![
+        card_with(column![head, intro].spacing(16).into(), 24),
+        card_with(imports, 24),
+        card_with(git, 24),
+        card_with(rebuild, 24),
+        card_with(notes, 24),
+    ]
+    .spacing(16)
+    .into()
+}
+
+fn step<'a>(number: u8, title: &'static str, body: Element<'a, Message>) -> Element<'a, Message> {
+    row![
+        container(text(number.to_string()).size(13).font(BOLD).color(ACCENT))
+            .width(28)
+            .height(28)
+            .center(28)
+            .style(theme::chip(ACCENT)),
+        column![text(title).size(16).font(BOLD), body].spacing(10).width(Length::Fill),
+    ]
+    .spacing(16)
+    .into()
+}
+
+fn caption<'a>(label: &'static str) -> Element<'a, Message> {
+    text(label).size(13).color(MUTED).font(BOLD).into()
+}
+
+fn bullet<'a>(content: String) -> Element<'a, Message> {
+    row![text("•").size(14).color(MUTED), text(content).size(14).width(Length::Fill)].spacing(10).into()
+}
+
+/// A snippet to read and to copy.
+fn code<'a>(app: &App, kind: Snippet, file: &str, host: &str) -> Element<'a, Message> {
+    container(
+        row![
+            text(snippet(kind, file, host)).size(13).font(Font::MONOSPACE).width(Length::Fill),
+            copy_button(app, CopyTarget::Snippet(kind), false),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Start),
+    )
+    .padding([12, 14])
+    .width(Length::Fill)
+    .style(theme::well)
+    .into()
 }

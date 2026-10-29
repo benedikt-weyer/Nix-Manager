@@ -10,12 +10,12 @@ use futures::StreamExt;
 use iced::{window, Subscription, Task};
 use nix_backend_client::settings::Settings;
 use nix_backend_client::{
-    BuildItem, BuildStats, Client, EventPhase, FlakeStatusReply, OperationEvent, OperationKind, Package, ProgressEvent,
-    RebuildMode, SearchPackagesReply, SystemTarget,
+    BuildItem, BuildStats, Client, Destination, EventPhase, FlakeStatusReply, OperationEvent, OperationKind, Package,
+    ProgressEvent, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
 };
 
 use fx::{Fx, Slot};
-use store::{Detail, Load, Store, Tab};
+use store::{Banner, BannerAction, Detail, Load, Snippet, Store, Tab};
 
 const ICON_PNG: &[u8] = include_bytes!("../../assets/icons/nix-manager-256.png");
 
@@ -79,6 +79,8 @@ pub enum CopyTarget {
     Output,
     /// Where the open package is defined in nixpkgs.
     SourcePath,
+    /// A snippet from the setup guide.
+    Snippet(Snippet),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -224,6 +226,19 @@ pub enum Message {
     OpenInstalled(usize),
     PackageLoaded(String, Result<Package, String>),
     OpenUrl(String),
+    DestinationsLoaded(SystemTarget, Result<Vec<Destination>, String>),
+    ReloadDestinations,
+    SelectDestination(String),
+    NewDestination,
+    NewDestinationName(String),
+    CreateDestination,
+    DestinationCreated(SystemTarget, Result<Destination, String>),
+    AddPackage(String),
+    RemovePackage(String),
+    PackageSet(SystemTarget, String, bool, Result<SetConfigPackageReply, String>),
+    OpenGuide,
+    DismissBanner,
+    GoToDashboard,
 }
 
 fn status_text(status: nix_backend_client::Status) -> String {
@@ -390,8 +405,12 @@ impl App {
             }
             Message::Connected(Ok(client)) => {
                 self.conn = Conn::Online(client.clone());
-                let installed = if self.page == Page::Store { self.load_installed() } else { Task::none() };
-                Task::batch([self.load_status(), watch(client), installed])
+                let store = if self.page == Page::Store {
+                    Task::batch([self.load_installed(), self.load_destinations()])
+                } else {
+                    Task::none()
+                };
+                Task::batch([self.load_status(), watch(client), store])
             }
             Message::Connected(Err(error)) => {
                 self.go_offline(error);
@@ -530,6 +549,9 @@ impl App {
                         .and_then(|detail| detail.package.ready())
                         .map(|package| package.source_path.clone())
                         .unwrap_or_default(),
+                    CopyTarget::Snippet(kind) => {
+                        store::snippet(kind, &self.store.destination, self.effective_host_name())
+                    }
                     CopyTarget::Message | CopyTarget::Output => {
                         let Some(run) = &self.run else { return Task::none() };
                         match target {
@@ -562,10 +584,12 @@ impl App {
                 self.show(Page::Store);
                 let installed =
                     if matches!(self.store.installed, Load::Idle) { self.load_installed() } else { Task::none() };
-                Task::batch([installed, iced::widget::operation::focus(store::SEARCH_ID)])
+                Task::batch([installed, self.load_destinations(), iced::widget::operation::focus(store::SEARCH_ID)])
             }
             Message::StoreBack => {
-                if self.store.detail.take().is_none() {
+                if self.store.guide {
+                    self.store.guide = false;
+                } else if self.store.detail.take().is_none() {
                     self.show(Page::Dashboard);
                 }
                 Task::none()
@@ -651,7 +675,169 @@ impl App {
                 open_url(&url);
                 Task::none()
             }
+            Message::ReloadDestinations => self.load_destinations(),
+            Message::DestinationsLoaded(requested, result) => {
+                if requested == self.target() {
+                    self.store.set_destinations(result);
+                }
+                Task::none()
+            }
+            Message::SelectDestination(file) => {
+                self.store.destination = file;
+                Task::none()
+            }
+            Message::NewDestination => {
+                self.store.naming = match self.store.naming {
+                    Some(_) => None,
+                    None => Some(String::new()),
+                };
+                Task::none()
+            }
+            Message::NewDestinationName(name) => {
+                if self.store.naming.is_some() {
+                    self.store.naming = Some(name);
+                }
+                Task::none()
+            }
+            Message::CreateDestination => {
+                let name = self.store.naming.clone().unwrap_or_default();
+                let Some(mut client) = self.client().filter(|_| !name.trim().is_empty() && !self.store.changing) else {
+                    return Task::none();
+                };
+                self.store.changing = true;
+                let target = self.target();
+                Task::perform(
+                    async move {
+                        let result = client.create_destination(target.clone(), name).await.map_err(status_text);
+                        (target, result)
+                    },
+                    |(target, result)| Message::DestinationCreated(target, result),
+                )
+            }
+            Message::DestinationCreated(requested, result) => {
+                self.store.changing = false;
+                if requested != self.target() {
+                    return Task::none();
+                }
+                self.store.banner = Some(match result {
+                    Ok(destination) => {
+                        let text = if destination.imported {
+                            format!("{} is ready to use.", destination.file)
+                        } else {
+                            format!(
+                                "Created {}. Your configuration has to import it before the packages in it are installed.",
+                                destination.file
+                            )
+                        };
+                        let action = (!destination.imported).then_some(BannerAction::Guide);
+                        self.store.destination = destination.file.clone();
+                        self.store.naming = None;
+                        self.store.put_destination(destination);
+                        Banner { text, error: false, action }
+                    }
+                    Err(error) => Banner { text: error, error: true, action: None },
+                });
+                Task::none()
+            }
+            Message::AddPackage(attr) => {
+                let file = self.store.destination.clone();
+                self.set_config_package(file, attr, true)
+            }
+            Message::RemovePackage(attr) => {
+                let Some(file) = self.store.configured(&attr).map(|destination| destination.file.clone()) else {
+                    return Task::none();
+                };
+                self.set_config_package(file, attr, false)
+            }
+            Message::PackageSet(requested, attr, present, result) => {
+                self.store.changing = false;
+                if requested != self.target() {
+                    return Task::none();
+                }
+                self.store.banner = Some(match result {
+                    Ok(reply) => {
+                        let destination = reply.destination.unwrap_or_default();
+                        let file = destination.file.clone();
+                        let staged = if reply.staged_in_git { " The new file was staged in git." } else { "" };
+                        let banner = match (present, destination.imported) {
+                            (true, true) => Banner {
+                                text: format!("Added {attr} to {file}. Rebuild to install it.{staged}"),
+                                error: false,
+                                action: Some(BannerAction::Rebuild),
+                            },
+                            (true, false) => Banner {
+                                text: format!(
+                                    "Added {attr} to {file}, but your configuration doesn't import that file yet.{staged}"
+                                ),
+                                error: false,
+                                action: Some(BannerAction::Guide),
+                            },
+                            (false, _) => Banner {
+                                text: format!("Removed {attr} from {file}. Rebuild to apply it."),
+                                error: false,
+                                action: Some(BannerAction::Rebuild),
+                            },
+                        };
+                        self.store.put_destination(destination);
+                        banner
+                    }
+                    Err(error) => Banner { text: error, error: true, action: None },
+                });
+                Task::none()
+            }
+            Message::OpenGuide => {
+                if self.page != Page::Store {
+                    self.show(Page::Store);
+                }
+                self.store.guide = true;
+                self.load_destinations()
+            }
+            Message::DismissBanner => {
+                self.store.banner = None;
+                Task::none()
+            }
+            Message::GoToDashboard => {
+                self.store.detail = None;
+                self.store.guide = false;
+                self.show(Page::Dashboard);
+                Task::none()
+            }
         }
+    }
+
+    fn load_destinations(&mut self) -> Task<Message> {
+        let Some(mut client) = self.client() else {
+            return Task::none();
+        };
+        if matches!(self.store.destinations, Load::Idle) {
+            self.store.destinations = Load::Loading;
+        }
+        let target = self.target();
+        Task::perform(
+            async move {
+                let result = client.list_destinations(target.clone()).await.map_err(status_text);
+                (target, result)
+            },
+            |(target, result)| Message::DestinationsLoaded(target, result),
+        )
+    }
+
+    /// Adds `attr` to (or removes it from) the destination `file`.
+    fn set_config_package(&mut self, file: String, attr: String, present: bool) -> Task<Message> {
+        let Some(mut client) = self.client().filter(|_| !self.store.changing) else {
+            return Task::none();
+        };
+        self.store.changing = true;
+        self.store.banner = None;
+        let target = self.target();
+        Task::perform(
+            async move {
+                let result =
+                    client.set_config_package(target.clone(), file, attr.clone(), present).await.map_err(status_text);
+                (target, attr, present, result)
+            },
+            |(target, attr, present, result)| Message::PackageSet(target, attr, present, result),
+        )
     }
 
     fn load_installed(&mut self) -> Task<Message> {

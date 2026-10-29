@@ -1,5 +1,6 @@
 mod activity;
 mod config;
+mod destinations;
 mod nix_ops;
 mod store;
 
@@ -20,9 +21,10 @@ use tonic::{Request, Response, Status};
 
 use proto::nix_backend_server::{NixBackend, NixBackendServer};
 use proto::{
-    FlakeStatusReply, FlakeStatusRequest, GetPackageRequest, ListInstalledReply, ListInstalledRequest, OperationEvent,
+    CreateDestinationRequest, Destination, FlakeStatusReply, FlakeStatusRequest, GetPackageRequest,
+    ListDestinationsReply, ListDestinationsRequest, ListInstalledReply, ListInstalledRequest, OperationEvent,
     OperationKind, Package, ProgressEvent, RebuildMode, RebuildRequest, SearchPackagesReply, SearchPackagesRequest,
-    UpdateFlakeRequest, WatchRequest,
+    SetConfigPackageReply, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
 };
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<ProgressEvent, Status>> + Send>>;
@@ -170,6 +172,37 @@ impl NixBackend for Service {
         let target = config::resolve(request.into_inner().target.as_ref());
         Ok(Response::new(store::installed(&target).await?))
     }
+
+    async fn list_destinations(
+        &self,
+        request: Request<ListDestinationsRequest>,
+    ) -> Result<Response<ListDestinationsReply>, Status> {
+        let target = config::resolve(request.into_inner().target.as_ref());
+        let destinations = blocking(move || destinations::list(&target.config_dir)).await?;
+        Ok(Response::new(ListDestinationsReply { destinations }))
+    }
+
+    async fn create_destination(&self, request: Request<CreateDestinationRequest>) -> Result<Response<Destination>, Status> {
+        let req = request.into_inner();
+        let target = config::resolve(req.target.as_ref());
+        Ok(Response::new(blocking(move || destinations::create(&target.config_dir, &req.name)).await?))
+    }
+
+    async fn set_config_package(
+        &self,
+        request: Request<SetConfigPackageRequest>,
+    ) -> Result<Response<SetConfigPackageReply>, Status> {
+        let req = request.into_inner();
+        let target = config::resolve(req.target.as_ref());
+        let reply =
+            blocking(move || destinations::set_package(&target.config_dir, &req.file, &req.attr, req.present)).await?;
+        Ok(Response::new(reply))
+    }
+}
+
+/// Runs file-system work off the async threads.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, Status> + Send + 'static) -> Result<T, Status> {
+    tokio::task::spawn_blocking(work).await.map_err(|e| Status::internal(format!("worker failed: {e}")))?
 }
 
 /// The daemon is usually spawned by the shell, whose systemd unit runs with a
