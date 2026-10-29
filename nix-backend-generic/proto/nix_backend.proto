@@ -1,0 +1,129 @@
+syntax = "proto3";
+
+// Local IPC contract between the shell (a grpc++ client, see
+// plugin/src/Caelestia/Services/NixBackend) and nix-backend-generic (the
+// tonic server implementing this service). Served over a unix socket, never
+// a network port - see src/main.rs.
+package caelestia.nixbackend.v1;
+
+service NixBackend {
+    // Runs `nix flake update` against the configured flake, streaming
+    // progress as it happens.
+    rpc UpdateFlake(UpdateFlakeRequest) returns (stream ProgressEvent);
+
+    // Builds the named nixosConfiguration, diffs it against the running
+    // system, then (unless mode is TEST) registers it as a system generation
+    // and activates it. Each privileged step is authorized individually via
+    // polkit (pkexec) - the daemon itself never runs as root.
+    rpc Rebuild(RebuildRequest) returns (stream ProgressEvent);
+
+    // Reports when the flake was last changed, from git history.
+    rpc GetFlakeStatus(FlakeStatusRequest) returns (FlakeStatusReply);
+}
+
+// Identifies which flake/host to operate on. Either field left empty falls
+// back to the daemon's own resolution (NIX_BACKEND_CONFIG_DIR /
+// NIX_BACKEND_HOST_NAME env vars, then /etc/nixos + `hostname`).
+message SystemTarget {
+    string config_dir = 1;
+    string host_name = 2;
+}
+
+enum RebuildMode {
+    REBUILD_MODE_UNSPECIFIED = 0;
+    SWITCH = 1;
+    BOOT = 2;
+    TEST = 3;
+}
+
+message UpdateFlakeRequest {
+    SystemTarget target = 1;
+}
+
+message RebuildRequest {
+    SystemTarget target = 1;
+    RebuildMode mode = 2;
+}
+
+message FlakeStatusRequest {
+    SystemTarget target = 1;
+}
+
+message FlakeStatusReply {
+    bool has_git_history = 1;
+    // RFC 3339 / ISO 8601, empty if has_git_history is false
+    string last_modified_iso8601 = 2;
+    string last_commit_subject = 3;
+    string last_commit_hash = 4;
+}
+
+enum EventPhase {
+    PHASE_UNSPECIFIED = 0;
+    STARTED = 1;
+    FLAKE_UPDATE = 2;
+    BUILD = 3;
+    DIFF = 4;
+    REGISTER = 5;
+    ACTIVATE = 6;
+    FINISHED = 7;
+    FAILED = 8;
+}
+
+enum BuildItemKind {
+    BUILD_ITEM_KIND_UNSPECIFIED = 0;
+    BUILD_ITEM_BUILD = 1;
+    BUILD_ITEM_DOWNLOAD = 2;
+}
+
+enum BuildItemStatus {
+    BUILD_ITEM_STATUS_UNSPECIFIED = 0;
+    BUILD_ITEM_RUNNING = 1;
+    BUILD_ITEM_DONE = 2;
+}
+
+// One derivation build or substitution download that's currently (or very
+// recently) in flight, derived from nix's own `--log-format internal-json`
+// activity stream (see nix-backend-generic/src/activity.rs). Nix doesn't
+// expose the full upfront dependency graph cheaply, so this is a live view
+// of what's actually running/just finished, not a precomputed plan.
+message BuildItem {
+    // The activity id nix assigned this item, stable for its lifetime.
+    uint64 id = 1;
+    BuildItemKind kind = 2;
+    BuildItemStatus status = 3;
+    // Derivation or store-path name, e.g. "hello-2.12.1".
+    string name = 4;
+    // Bytes transferred so far - only meaningful for downloads.
+    double bytes_done = 5;
+    // Expected total bytes - 0 if unknown.
+    double bytes_expected = 6;
+    double bytes_per_sec = 7;
+}
+
+// Aggregate counts nix itself reports for the whole build/substitution
+// graph, so the shell can show "N built, M downloading, K waiting" without
+// having to walk the dependency graph itself.
+message BuildStats {
+    int64 builds_done = 1;
+    int64 builds_expected = 2;
+    int64 builds_running = 3;
+    int64 builds_failed = 4;
+    int64 copies_done = 5;
+    int64 copies_expected = 6;
+    int64 copies_running = 7;
+    int64 copies_failed = 8;
+    int64 download_bytes_done = 9;
+    int64 download_bytes_expected = 10;
+}
+
+message ProgressEvent {
+    EventPhase phase = 1;
+    // Human-readable status line for display in the shell's log view.
+    string message = 2;
+    bool is_error = 3;
+    // 0..1 when derivable from nix's own progress reporting, -1 otherwise.
+    double fraction_done = 4;
+    // Current snapshot of in-flight/recently-finished builds and downloads.
+    repeated BuildItem active_items = 5;
+    BuildStats stats = 6;
+}
