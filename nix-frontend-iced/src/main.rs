@@ -43,6 +43,7 @@ pub enum Action {
 impl Action {
     pub const ALL: [Action; fx::ACTIONS] = [
         Action::Update,
+        Action::Rebuild(RebuildMode::BuildOnly),
         Action::Rebuild(RebuildMode::Switch),
         Action::Rebuild(RebuildMode::Boot),
         Action::Rebuild(RebuildMode::Test),
@@ -106,6 +107,7 @@ impl Run {
     pub fn steps(&self) -> &'static [EventPhase] {
         match (self.kind, self.mode) {
             (OperationKind::UpdateFlake, _) => &[EventPhase::FlakeUpdate],
+            (_, RebuildMode::BuildOnly) => &[EventPhase::Build, EventPhase::Diff],
             (_, RebuildMode::Test) => &[EventPhase::Build, EventPhase::Diff, EventPhase::Activate],
             _ => &[EventPhase::Build, EventPhase::Diff, EventPhase::Register, EventPhase::Activate],
         }

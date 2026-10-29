@@ -19,7 +19,7 @@ pub enum Slot {
 }
 
 const SLOTS: usize = 4;
-pub const ACTIONS: usize = 4;
+pub const ACTIONS: usize = 5;
 
 /// Distance (px) a section slides while fading in.
 pub const SLIDE: f32 = 14.0;

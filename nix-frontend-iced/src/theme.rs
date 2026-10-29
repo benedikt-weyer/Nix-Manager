@@ -15,6 +15,7 @@ pub const ACCENT: Color = Color::from_rgb8(0x6f, 0xa8, 0xff);
 pub const ACCENT_ALT: Color = Color::from_rgb8(0x9d, 0x86, 0xff);
 pub const SUCCESS: Color = Color::from_rgb8(0x3d, 0xd6, 0x8c);
 pub const DANGER: Color = Color::from_rgb8(0xff, 0x6b, 0x6b);
+pub const TEAL: Color = Color::from_rgb8(0x4f, 0xd1, 0xc5);
 pub const WARNING: Color = Color::from_rgb8(0xf5, 0xb9, 0x4a);
 
 pub const RADIUS: f32 = 16.0;

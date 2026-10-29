@@ -110,6 +110,7 @@ fn mode_label(mode: RebuildMode) -> &'static str {
     match mode {
         RebuildMode::Boot => "boot",
         RebuildMode::Test => "test",
+        RebuildMode::BuildOnly => "build",
         RebuildMode::Switch | RebuildMode::Unspecified => "switch",
     }
 }
@@ -183,6 +184,14 @@ pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, tx: EventTx) {
             return;
         }
     };
+
+    if mode == RebuildMode::BuildOnly {
+        // Build only: no generation, no bootloader entry, no activation, and
+        // so no privileged step at all.
+        let _ = tokio::fs::remove_file(&out_link).await;
+        send(&tx, EventPhase::Finished, format!("Build complete: {resolved}"), false).await;
+        return;
+    }
 
     if mode != RebuildMode::Test {
         send(&tx, EventPhase::Register, "Registering system generation (authorization required)", false).await;

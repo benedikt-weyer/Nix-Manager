@@ -77,7 +77,7 @@ trap cleanup EXIT INT TERM
 
 if socket_alive "$NIX_BACKEND_SOCKET"; then
     [[ $mode == backend ]] && die "a backend is already running on $NIX_BACKEND_SOCKET"
-    info "Backend already running on $NIX_BACKEND_SOCKET - attaching to it"
+    info "Backend already running on $NIX_BACKEND_SOCKET - attaching to it (it is not rebuilt or restarted; stop it first after backend changes)"
 elif [[ $mode == frontend ]]; then
     warn "no backend on $NIX_BACKEND_SOCKET yet - the windows will keep retrying until one starts"
 else

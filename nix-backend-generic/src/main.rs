@@ -115,7 +115,10 @@ impl NixBackend for Service {
     async fn rebuild(&self, request: Request<RebuildRequest>) -> Result<Response<Self::RebuildStream>, Status> {
         let req = request.into_inner();
         let target = config::resolve(req.target.as_ref());
-        let mode = RebuildMode::try_from(req.mode).unwrap_or(RebuildMode::Switch);
+        // An unknown value (a newer client talking to this backend) must never
+        // fall back to a mode that activates the system.
+        let mode = RebuildMode::try_from(req.mode)
+            .map_err(|_| Status::invalid_argument(format!("unknown rebuild mode {}", req.mode)))?;
         self.hub.begin(OperationKind::Rebuild, mode)?;
         let (tx, rx) = mpsc::channel(64);
         let (out_tx, out_rx) = mpsc::channel(64);

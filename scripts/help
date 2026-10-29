@@ -17,7 +17,7 @@ Run
                                        everything after --cli goes to the CLI, e.g. --cli rebuild test
 
 CLI (nix-frontend-cli, binary `nix-manager`)
-  nix-manager status | update | rebuild [switch|boot|test] | watch
+  nix-manager status | update | rebuild [switch|boot|test|build] | watch
   nix-manager -c DIR -H HOST -s SOCKET -q ...            (global flags)
   zsh tab completion:   source <(nix-manager completions zsh)      (needs compinit)
   or install it:        nix-manager completions zsh > ~/.zfunc/_nix-manager    (~/.zfunc in fpath)

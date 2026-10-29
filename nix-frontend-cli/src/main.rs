@@ -41,7 +41,7 @@ enum Command {
     Update,
     /// Build the system configuration and activate it
     Rebuild {
-        /// How to activate: switch now, on next boot, or test (not persistent)
+        /// How to activate: switch now, on next boot, test (not persistent), or just build
         #[arg(value_enum, default_value = "switch")]
         mode: Mode,
     },
@@ -59,6 +59,8 @@ enum Mode {
     Boot,
     /// Build and activate now, without registering a generation
     Test,
+    /// Build only: no generation, no bootloader entry, no activation
+    Build,
 }
 
 impl From<Mode> for RebuildMode {
@@ -67,6 +69,7 @@ impl From<Mode> for RebuildMode {
             Mode::Switch => RebuildMode::Switch,
             Mode::Boot => RebuildMode::Boot,
             Mode::Test => RebuildMode::Test,
+            Mode::Build => RebuildMode::BuildOnly,
         }
     }
 }

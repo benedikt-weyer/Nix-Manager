@@ -12,8 +12,8 @@ service NixBackend {
     rpc UpdateFlake(UpdateFlakeRequest) returns (stream ProgressEvent);
 
     // Builds the named nixosConfiguration, diffs it against the running
-    // system, then (unless mode is TEST) registers it as a system generation
-    // and activates it. Each privileged step is authorized individually via
+    // system, then (unless mode is BUILD_ONLY or TEST) registers it as a system
+    // generation and (unless mode is BUILD_ONLY) activates it. Each privileged step is authorized individually via
     // polkit (pkexec) - the daemon itself never runs as root.
     rpc Rebuild(RebuildRequest) returns (stream ProgressEvent);
 
@@ -44,6 +44,9 @@ enum RebuildMode {
     SWITCH = 1;
     BOOT = 2;
     TEST = 3;
+    // Build and diff only: nothing is registered as a system generation, the
+    // bootloader is untouched and the running system is not activated.
+    BUILD_ONLY = 4;
 }
 
 message UpdateFlakeRequest {

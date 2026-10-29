@@ -11,7 +11,7 @@ use nix_backend_client::{
 };
 
 use crate::fx::{Fx, Slot, SLIDE};
-use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEXT, WARNING};
+use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
 use crate::{Action, App, Conn, Message, Outcome, Run};
 
 const BOLD: Font = Font { weight: font::Weight::Semibold, ..Font::DEFAULT };
@@ -260,6 +260,9 @@ fn action_info(action: Action) -> ActionInfo {
             tint: ACCENT,
             icon: lucide::refresh_cw(),
         },
+        Action::Rebuild(RebuildMode::BuildOnly) => {
+            ActionInfo { title: "Build", detail: "Build only, don't activate", tint: TEAL, icon: lucide::hammer() }
+        }
         Action::Rebuild(RebuildMode::Boot) => {
             ActionInfo { title: "Boot", detail: "Activate on next boot", tint: WARNING, icon: lucide::power() }
         }
@@ -343,6 +346,7 @@ fn notice_banner(notice: &str) -> Element<'_, Message> {
 fn run_title(run: &Run) -> String {
     match (run.kind, run.mode) {
         (OperationKind::UpdateFlake, _) => "Updating flake inputs".to_owned(),
+        (_, RebuildMode::BuildOnly) => "Building · not activated".to_owned(),
         (_, RebuildMode::Boot) => "Rebuilding · boot".to_owned(),
         (_, RebuildMode::Test) => "Rebuilding · test".to_owned(),
         _ => "Rebuilding · switch".to_owned(),
