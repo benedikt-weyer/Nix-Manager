@@ -24,6 +24,10 @@ CLI (nix-frontend-cli, binary `nix-manager`)
   also: completions bash | fish | elvish | powershell
   ./scripts/run -c DIR -H HOST         point the backend at a flake directory / nixosConfiguration
 
+  Switch/Boot/Test need pkexec, which cannot work if the backend inherited no_new_privs
+  (e.g. started from some sandboxed editor terminals) - the backend now says so right away.
+  Build-only needs no privileges.
+
   The backend uses its own socket ($XDG_RUNTIME_DIR/nix-manager-dev.sock), so it never
   takes over a real daemon's socket. The default target is /etc/nixos: rebuilds and
   updates are real, so use -c with a scratch flake while developing.

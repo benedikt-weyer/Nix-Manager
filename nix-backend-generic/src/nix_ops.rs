@@ -140,9 +140,32 @@ pub async fn update_flake(target: &ResolvedTarget, tx: EventTx) {
     }
 }
 
+/// With `no_new_privs` set (inherited from whatever launched the daemon, e.g.
+/// a sandboxed terminal or editor) the kernel ignores setuid bits, so the
+/// pkexec wrapper can never elevate: it just prints "pkexec must be setuid
+/// root". Detect that up front instead of after a long build.
+fn no_new_privs() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .map(|status| status.lines().any(|line| line.strip_prefix("NoNewPrivs:").is_some_and(|v| v.trim() == "1")))
+        .unwrap_or(false)
+}
+
 pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, tx: EventTx) {
     let action = mode_label(mode);
     send(&tx, EventPhase::Started, format!("Rebuilding '{}' ({action})", target.host_name), false).await;
+
+    if mode != RebuildMode::BuildOnly && no_new_privs() {
+        send(
+            &tx,
+            EventPhase::Failed,
+            "Cannot elevate: this backend runs with no_new_privs set (inherited from the process that started it), \
+             so pkexec can't work. Start the backend from a regular session or the systemd user service - or use \
+             the build-only mode, which needs no privileges.",
+            true,
+        )
+        .await;
+        return;
+    }
 
     let out_link = out_link_path();
     let flake_attr = format!(
