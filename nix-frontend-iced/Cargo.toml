@@ -16,4 +16,5 @@ iced_fonts = { version = "0.3", features = ["lucide"] }
 mina = "0.1"
 enum-map = "2"
 futures = "0.3"
+png = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

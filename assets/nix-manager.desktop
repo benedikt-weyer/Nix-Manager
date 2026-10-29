@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nix Manager
+GenericName=NixOS Manager
+Comment=Update and rebuild your NixOS flake
+Exec=nix-manager-gui
+Icon=nix-manager
+Terminal=false
+Categories=System;Settings;
+Keywords=nix;nixos;flake;rebuild;update;
+StartupWMClass=nix-manager

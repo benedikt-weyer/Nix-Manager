@@ -24,6 +24,29 @@ Flakes only see git-tracked files: `git add flake.nix flake.lock` before using `
 
 `./scripts/run` defaults to operating on `/etc/nixos`; use `-c DIR -H HOST` to point it at a scratch flake while developing.
 
+## Install (NixOS)
+
+The flake builds everything with [crane](https://github.com/ipetkov/crane):
+
+```sh
+nix build .#default            # backend + CLI + GUI together
+nix run .#nix-manager-gui      # or .#nix-manager-cli, .#nix-backend-generic
+```
+
+As a NixOS module (adds the programs and a systemd user service for the backend):
+
+```nix
+inputs.nix-manager.url = "github:benedikt-weyer/Nix-Manager";
+# ...
+modules = [ inputs.nix-manager.nixosModules.default ];
+# configuration.nix:
+programs.nix-manager.enable = true;   # programs.nix-manager.backend.enable = false to skip the service
+```
+
+The installed programs use their own socket (`$XDG_RUNTIME_DIR/nix-manager.sock`), so they don't collide with
+another `nix-backend-generic` (e.g. the shell's). The GUI ships with a logo (`assets/icons/nix-manager.svg`)
+and a desktop entry.
+
 ## CLI
 
 ```sh

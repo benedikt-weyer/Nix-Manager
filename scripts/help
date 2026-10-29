@@ -32,6 +32,11 @@ CLI (nix-frontend-cli, binary `nix-manager`)
   takes over a real daemon's socket. The default target is /etc/nixos: rebuilds and
   updates are real, so use -c with a scratch flake while developing.
 
+Package (crane)
+  nix build .#default                       backend + CLI + GUI   (flake only sees git-tracked files)
+  nix build .#nix-manager-gui               or .#nix-manager-cli / .#nix-backend-generic
+  nix flake check                           builds all packages + clippy
+
 Build, check, test
   cargo build --workspace                                         client + frontends
   cargo build --manifest-path nix-backend-generic/Cargo.toml      backend (standalone crate)

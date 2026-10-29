@@ -14,6 +14,21 @@ use nix_backend_client::{
 
 use fx::{Fx, Slot};
 
+const ICON_PNG: &[u8] = include_bytes!("../../assets/icons/nix-manager-256.png");
+
+/// The logo as a window icon. Shown on X11; Wayland compositors pick the icon
+/// from the desktop entry matching the app id instead.
+fn window_icon() -> Option<window::Icon> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(ICON_PNG)).read_info().ok()?;
+    let mut pixels = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut pixels).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    pixels.truncate(info.buffer_size());
+    window::icon::from_rgba(pixels, info.width, info.height).ok()
+}
+
 fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
         .title("Nix Manager")
@@ -24,6 +39,7 @@ fn main() -> iced::Result {
         .window(window::Settings {
             size: iced::Size::new(1040.0, 800.0),
             min_size: Some(iced::Size::new(760.0, 560.0)),
+            icon: window_icon(),
             platform_specific: window::settings::PlatformSpecific {
                 application_id: "nix-manager".to_owned(),
                 ..Default::default()
