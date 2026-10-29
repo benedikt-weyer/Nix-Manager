@@ -113,6 +113,8 @@ pub struct ActivityTracker {
     finished_order: Vec<i64>,
     stats: BuildStats,
     downloaded_bytes_total: f64,
+    rate_sample: Option<(Instant, f64)>,
+    download_rate: f64,
 }
 
 impl ActivityTracker {
@@ -127,6 +129,23 @@ impl ActivityTracker {
             Some("stop") => self.handle_stop(value),
             _ => {}
         }
+    }
+
+    /// Smoothed combined throughput of every download, sampled at most twice
+    /// a second so the figure doesn't jitter with each progress line.
+    fn sample_download_rate(&mut self) {
+        let now = Instant::now();
+        let Some((then, previous)) = self.rate_sample else {
+            self.rate_sample = Some((now, self.downloaded_bytes_total));
+            return;
+        };
+        let dt = now.duration_since(then).as_secs_f64();
+        if dt < 0.5 {
+            return;
+        }
+        let instant = (self.downloaded_bytes_total - previous).max(0.0) / dt;
+        self.download_rate = if self.download_rate > 0.0 { 0.6 * self.download_rate + 0.4 * instant } else { instant };
+        self.rate_sample = Some((now, self.downloaded_bytes_total));
     }
 
     fn handle_start(&mut self, value: &Value) {
@@ -157,10 +176,15 @@ impl ActivityTracker {
                     act.bytes_done = act.bytes_expected;
                 }
                 act.bytes_per_sec = 0.0;
+                let was_download = act.kind == TrackedKind::Download;
                 self.finished_order.push(id);
                 while self.finished_order.len() > MAX_FINISHED {
                     let old = self.finished_order.remove(0);
                     self.activities.remove(&old);
+                }
+                if was_download && !self.activities.values().any(|a| a.kind == TrackedKind::Download && a.status == BuildItemStatus::BuildItemRunning) {
+                    self.download_rate = 0.0;
+                    self.rate_sample = None;
                 }
             }
             _ => {
@@ -186,6 +210,7 @@ impl ActivityTracker {
                     TrackedKind::Download => {
                         self.downloaded_bytes_total += (done - act.bytes_done).max(0.0);
                         act.update_bytes(done, expected.max(act.bytes_expected));
+                        self.sample_download_rate();
                     }
                     TrackedKind::Build => act.update_bytes(done, expected.max(act.bytes_expected)),
                     TrackedKind::BuildsContainer => {
@@ -245,18 +270,52 @@ impl ActivityTracker {
 
         let mut stats = self.stats.clone();
         stats.download_bytes_done = self.downloaded_bytes_total as i64;
+        stats.download_bytes_per_sec = self.download_rate;
         (items, stats)
     }
 }
 
 /// Overall progress across both builds and substitutions, when nix has told
-/// us how many of each to expect; -1 (indeterminate) otherwise.
+/// us how many of each to expect; -1 (indeterminate) otherwise. Substitutions
+/// count by the bytes fetched so far, not only by how many have finished, so
+/// the figure keeps moving during one big download.
 pub fn fraction_done(stats: &BuildStats) -> f64 {
-    let done = stats.builds_done + stats.copies_done;
     let expected = stats.builds_expected + stats.copies_expected;
-    if expected > 0 {
-        (done as f64 / expected as f64).clamp(0.0, 1.0)
-    } else {
-        -1.0
+    if expected <= 0 {
+        return -1.0;
+    }
+    let ratio = |done: f64, total: f64| if total > 0.0 { done / total } else { 0.0 };
+    let copies = ratio(stats.copies_done as f64, stats.copies_expected as f64)
+        .max(ratio(stats.download_bytes_done as f64, stats.download_bytes_expected as f64))
+        .clamp(0.0, 1.0);
+    let done = stats.builds_done as f64 + copies * stats.copies_expected as f64;
+    (done / expected as f64).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_bytes_move_the_fraction_before_any_copy_finishes() {
+        let stats = BuildStats {
+            builds_expected: 1,
+            copies_expected: 1,
+            download_bytes_expected: 1000,
+            download_bytes_done: 500,
+            ..Default::default()
+        };
+        assert_eq!(fraction_done(&stats), 0.25);
+    }
+
+    #[test]
+    fn finished_copies_are_never_undercounted_by_bytes() {
+        let stats = BuildStats { copies_expected: 2, copies_done: 2, download_bytes_expected: 1000, ..Default::default() };
+        assert_eq!(fraction_done(&stats), 1.0);
+    }
+
+    #[test]
+    fn nothing_expected_is_indeterminate() {
+        assert_eq!(fraction_done(&BuildStats::default()), -1.0);
     }
 }

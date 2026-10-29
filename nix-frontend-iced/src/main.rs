@@ -169,6 +169,9 @@ pub struct App {
     pub notice: Option<String>,
     local_hostname: String,
     pub show_log: bool,
+    /// Whether the downloads/builds list shows every running item instead of
+    /// just the first few.
+    pub show_all_items: bool,
     /// How far the output view is scrolled up from its bottom, in px (0 =
     /// following the newest line). The view only draws the rows around it.
     pub log_from_bottom: f32,
@@ -197,6 +200,7 @@ pub enum Message {
     StartRejected(String),
     Hover(usize, bool),
     ToggleLog,
+    ToggleItems,
     LogScrolled(f32),
     Copy(CopyTarget),
     DismissRun,
@@ -250,6 +254,7 @@ impl App {
                 .map(|name| name.trim().to_owned())
                 .unwrap_or_default(),
             show_log: true,
+            show_all_items: false,
             log_from_bottom: 0.0,
             copied: None,
             fx: Fx::new(),
@@ -484,6 +489,10 @@ impl App {
                 self.show_log = !self.show_log;
                 // A freshly shown scrollable starts at its bottom.
                 self.log_from_bottom = 0.0;
+                Task::none()
+            }
+            Message::ToggleItems => {
+                self.show_all_items = !self.show_all_items;
                 Task::none()
             }
             Message::LogScrolled(from_bottom) => {

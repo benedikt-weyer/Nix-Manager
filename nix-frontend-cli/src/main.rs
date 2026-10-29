@@ -230,11 +230,16 @@ impl Printer {
         }
         if stats.copies_expected > 0 {
             parts.push(format!(
-                "downloads {}/{} ({} / {})",
+                "downloads {}/{} ({} / {}{})",
                 stats.copies_done,
                 stats.copies_expected,
                 format_bytes(stats.download_bytes_done as f64),
-                format_bytes(stats.download_bytes_expected as f64)
+                format_bytes(stats.download_bytes_expected as f64),
+                if stats.download_bytes_per_sec > 0.0 {
+                    format!(", {}/s", format_bytes(stats.download_bytes_per_sec))
+                } else {
+                    String::new()
+                }
             ));
         }
         if event.fraction_done >= 0.0 {

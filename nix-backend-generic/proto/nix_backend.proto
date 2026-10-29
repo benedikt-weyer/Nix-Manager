@@ -134,6 +134,8 @@ message BuildStats {
     int64 copies_failed = 8;
     int64 download_bytes_done = 9;
     int64 download_bytes_expected = 10;
+    // Smoothed combined throughput of all running downloads, 0 when idle.
+    double download_bytes_per_sec = 11;
 }
 
 message ProgressEvent {

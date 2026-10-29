@@ -7,7 +7,7 @@ use iced::widget::{
 use iced::{font, mouse, Alignment, Color, Element, Font, Length, Padding};
 use iced_fonts::lucide;
 use nix_backend_client::{
-    format_bytes, phase_label, BuildItemKind, BuildItemStatus, EventPhase, OperationKind, RebuildMode,
+    format_bytes, phase_label, BuildItem, BuildItemKind, BuildItemStatus, EventPhase, OperationKind, RebuildMode,
 };
 
 use crate::fx::{Fx, Slot, SLIDE};
@@ -496,7 +496,7 @@ fn activity<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
         body = body.push(chips);
     }
     if !run.items.is_empty() {
-        body = body.push(items(run));
+        body = body.push(items(app, run, fx));
     }
     body = body.push(log(app, run));
 
@@ -568,26 +568,37 @@ fn step_icon(phase: EventPhase) -> Text<'static> {
     }
 }
 
-fn progress<'a>(run: &Run, fx: &Fx, tint: Color) -> Element<'a, Message> {
+/// A bar of the given `height` filled to `value` (0..1), or, when nothing is
+/// measurable yet (`None`), with a highlight sweeping across it.
+fn bar<'a>(value: Option<f32>, fx: &Fx, tint: Color, track_color: Color, height: f32) -> Element<'a, Message> {
     const SCALE: f32 = 1000.0;
     let portion = |v: f32| Length::FillPortion((v * SCALE).round().max(1.0) as u16);
+    let radius = height / 2.0;
 
-    let fill = |color: Color| container(space::horizontal()).height(8).style(theme::glowing(color, 4.0, 0.5));
+    let fill = |color: Color| container(space::horizontal()).height(height).style(theme::glowing(color, radius, 0.5));
 
-    let track: Element<_> = if run.fraction.is_some() || !run.running() {
-        let value = fx.progress().clamp(0.0, 1.0);
-        row![fill(tint).width(portion(value)), space::horizontal().width(portion(1.0 - value))].into()
-    } else {
-        // Nothing measurable yet: a highlight sweeps across the track.
-        const SEGMENT: f32 = 0.28;
-        let lead = fx.sweep() * (1.0 - SEGMENT);
-        row![
-            space::horizontal().width(portion(lead)),
-            fill(tint).width(portion(SEGMENT)),
-            space::horizontal().width(portion(1.0 - SEGMENT - lead))
-        ]
-        .into()
+    let track: Element<_> = match value {
+        Some(value) => {
+            let value = value.clamp(0.0, 1.0);
+            row![fill(tint).width(portion(value)), space::horizontal().width(portion(1.0 - value))].into()
+        }
+        None => {
+            const SEGMENT: f32 = 0.28;
+            let lead = fx.sweep() * (1.0 - SEGMENT);
+            row![
+                space::horizontal().width(portion(lead)),
+                fill(tint).width(portion(SEGMENT)),
+                space::horizontal().width(portion(1.0 - SEGMENT - lead))
+            ]
+            .into()
+        }
     };
+
+    container(track).width(Length::Fill).height(height).style(theme::solid(track_color, radius)).into()
+}
+
+fn progress<'a>(run: &Run, fx: &Fx, tint: Color) -> Element<'a, Message> {
+    let value = (run.fraction.is_some() || !run.running()).then(|| fx.progress());
 
     let label = match run.fraction {
         Some(_) => format!("{:.0}%", fx.progress() * 100.0),
@@ -596,7 +607,7 @@ fn progress<'a>(run: &Run, fx: &Fx, tint: Color) -> Element<'a, Message> {
     };
 
     row![
-        container(track).width(Length::Fill).height(8).style(theme::solid(theme::RAISED, 4.0)),
+        bar(value, fx, tint, theme::RAISED, 8.0),
         text(label).size(13).color(MUTED).font(Font::MONOSPACE).width(44).align_x(iced::alignment::Horizontal::Right),
     ]
     .spacing(14)
@@ -631,11 +642,16 @@ fn stat_chips<'a>(run: &Run) -> Option<Element<'a, Message>> {
         chips = chips.push(chip(
             lucide::download(),
             format!(
-                "Downloads {}/{} · {} / {}",
+                "Downloads {}/{} · {} / {}{}",
                 stats.copies_done,
                 stats.copies_expected,
                 format_bytes(stats.download_bytes_done as f64),
-                format_bytes(stats.download_bytes_expected as f64)
+                format_bytes(stats.download_bytes_expected as f64),
+                if stats.download_bytes_per_sec > 0.0 {
+                    format!(" · {}/s", format_bytes(stats.download_bytes_per_sec))
+                } else {
+                    String::new()
+                }
             ),
             ACCENT_ALT,
         ));
@@ -650,46 +666,69 @@ fn stat_chips<'a>(run: &Run) -> Option<Element<'a, Message>> {
     Some(chips.wrap().into())
 }
 
-fn items<'a>(run: &'a Run) -> Element<'a, Message> {
+fn items<'a>(app: &'a App, run: &'a Run, fx: &Fx) -> Element<'a, Message> {
     const SHOWN: usize = 6;
+    /// Past this many rows an expanded list scrolls instead of growing.
+    const SCROLL_AFTER: usize = 12;
 
-    let mut list = column![].spacing(6);
-    for item in run.items.iter().filter(|item| item.status() == BuildItemStatus::BuildItemRunning).take(SHOWN) {
-        let (icon, tint) = match item.kind() {
-            BuildItemKind::BuildItemDownload => (lucide::download(), ACCENT_ALT),
-            _ => (lucide::hammer(), ACCENT),
-        };
-        let detail = if item.kind() == BuildItemKind::BuildItemDownload && item.bytes_expected > 0.0 {
+    let running: Vec<&BuildItem> =
+        run.items.iter().filter(|item| item.status() == BuildItemStatus::BuildItemRunning).collect();
+    let shown = if app.show_all_items { running.len() } else { SHOWN };
+
+    let mut list = column![].spacing(10);
+    for item in running.iter().take(shown) {
+        let download = item.kind() == BuildItemKind::BuildItemDownload;
+        let (icon, tint) = if download { (lucide::download(), ACCENT_ALT) } else { (lucide::hammer(), ACCENT) };
+        let detail = if download && item.bytes_expected > 0.0 {
             format!(
                 "{} / {}  ·  {}/s",
                 format_bytes(item.bytes_done),
                 format_bytes(item.bytes_expected),
                 format_bytes(item.bytes_per_sec)
             )
+        } else if download && item.bytes_done > 0.0 {
+            format!("{}  ·  {}/s", format_bytes(item.bytes_done), format_bytes(item.bytes_per_sec))
         } else {
             String::new()
         };
-        list = list.push(
-            row![
-                icon.size(13).color(tint),
-                text(item.name.clone()).size(13).font(Font::MONOSPACE).width(Length::Fill).wrapping(Wrapping::None),
-                text(detail).size(12).color(MUTED),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-        );
-    }
-    let hidden = run
-        .items
-        .iter()
-        .filter(|item| item.status() == BuildItemStatus::BuildItemRunning)
-        .count()
-        .saturating_sub(SHOWN);
-    if hidden > 0 {
-        list = list.push(text(format!("+{hidden} more")).size(12).color(MUTED));
+        let mut entry = column![row![
+            icon.size(13).color(tint),
+            text(item.name.clone()).size(13).font(Font::MONOSPACE).width(Length::Fill).wrapping(Wrapping::None),
+            text(detail).size(12).color(MUTED),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)]
+        .spacing(5);
+        // Builds have nothing to measure; a download of unknown size sweeps.
+        if download {
+            let value = (item.bytes_expected > 0.0).then(|| (item.bytes_done / item.bytes_expected) as f32);
+            entry = entry.push(bar(value, fx, tint, theme::BORDER, 4.0));
+        }
+        list = list.push(entry);
     }
 
-    container(list).padding([12, 14]).width(Length::Fill).style(theme::well).into()
+    let list: Element<_> = if app.show_all_items && running.len() > SCROLL_AFTER {
+        scrollable(list.padding([0, 8]).width(Length::Fill)).height(300).into()
+    } else {
+        list.into()
+    };
+
+    let mut body = column![list].spacing(10);
+    if running.len() > SHOWN {
+        let (chevron, label) = if app.show_all_items {
+            (lucide::chevron_down(), "Show fewer".to_owned())
+        } else {
+            (lucide::chevron_right(), format!("Show all {}", running.len()))
+        };
+        body = body.push(
+            button(row![chevron.size(13), text(label).size(12)].spacing(6).align_y(Alignment::Center))
+                .padding([4, 8])
+                .style(ghost_button)
+                .on_press(Message::ToggleItems),
+        );
+    }
+
+    container(body).padding([12, 14]).width(Length::Fill).style(theme::well).into()
 }
 
 fn log<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
