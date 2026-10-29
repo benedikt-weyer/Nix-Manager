@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use iced::widget::text_editor;
 use iced::{window, Subscription, Task};
-use nix_backend_client::settings::Settings;
+use nix_backend_client::settings::{self, Settings};
 use nix_backend_client::{
     BuildItem, BuildStats, Client, Destination, EventPhase, FlakeStatusReply, OperationEvent, OperationKind, Package,
     ProgressEvent, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
@@ -158,11 +158,14 @@ pub struct App {
     /// The applied target: what actions use and what is persisted.
     pub config_dir: String,
     pub host_name: String,
+    /// The command that opens the configuration; empty means the default.
+    pub editor: String,
     pub page: Page,
     /// What the settings page inputs currently say; becomes the applied
     /// target on Apply.
     pub draft_config_dir: String,
     pub draft_host_name: String,
+    pub draft_editor: String,
     /// What the backend falls back to when a field is empty, once it has said.
     pub default_config_dir: Option<String>,
     pub default_host_name: Option<String>,
@@ -202,6 +205,8 @@ pub enum Message {
     CloseSettings,
     DraftConfigDirChanged(String),
     DraftHostNameChanged(String),
+    DraftEditorChanged(String),
+    OpenConfig,
     ApplySettings,
     RevertDraft,
     UseDefaults,
@@ -277,9 +282,11 @@ impl App {
             conn: Conn::Connecting,
             config_dir: from_env("NIX_BACKEND_CONFIG_DIR", &saved.config_dir),
             host_name: from_env("NIX_BACKEND_HOST_NAME", &saved.host_name),
+            editor: saved.editor.clone(),
             page: Page::Dashboard,
             draft_config_dir: String::new(),
             draft_host_name: String::new(),
+            draft_editor: String::new(),
             default_config_dir: None,
             default_host_name: None,
             saved,
@@ -302,6 +309,7 @@ impl App {
         let mut app = app;
         app.draft_config_dir = app.config_dir.clone();
         app.draft_host_name = app.host_name.clone();
+        app.draft_editor = app.editor.clone();
         (app, connect())
     }
 
@@ -326,14 +334,25 @@ impl App {
         }
     }
 
+    /// The editor command that will be used: what was typed, else the default.
+    pub fn effective_editor(&self) -> &str {
+        match self.editor.trim() {
+            "" => settings::DEFAULT_EDITOR,
+            typed => typed,
+        }
+    }
+
     /// Whether the settings page has edits that aren't applied yet.
     pub fn settings_dirty(&self) -> bool {
-        self.draft_config_dir.trim() != self.config_dir.trim() || self.draft_host_name.trim() != self.host_name.trim()
+        self.draft_config_dir.trim() != self.config_dir.trim()
+            || self.draft_host_name.trim() != self.host_name.trim()
+            || self.draft_editor.trim() != self.editor.trim()
     }
 
     fn revert_draft(&mut self) {
         self.draft_config_dir = self.config_dir.clone();
         self.draft_host_name = self.host_name.clone();
+        self.draft_editor = self.editor.clone();
     }
 
     /// Switches page and plays the entrance of the new content.
@@ -468,6 +487,14 @@ impl App {
                 self.draft_host_name = value;
                 Task::none()
             }
+            Message::DraftEditorChanged(value) => {
+                self.draft_editor = value;
+                Task::none()
+            }
+            Message::OpenConfig => {
+                self.notice = open_in_editor(self.effective_editor(), self.effective_config_dir()).err();
+                Task::none()
+            }
             Message::RevertDraft => {
                 self.revert_draft();
                 Task::none()
@@ -475,13 +502,19 @@ impl App {
             Message::UseDefaults => {
                 self.draft_config_dir.clear();
                 self.draft_host_name.clear();
+                self.draft_editor.clear();
                 Task::none()
             }
             Message::ApplySettings => {
                 if !self.settings_dirty() {
                     return Task::none();
                 }
-                let (dir, host) = (self.draft_config_dir.trim().to_owned(), self.draft_host_name.trim().to_owned());
+                let (dir, host, editor) = (
+                    self.draft_config_dir.trim().to_owned(),
+                    self.draft_host_name.trim().to_owned(),
+                    self.draft_editor.trim().to_owned(),
+                );
+                let target_changed = dir != self.config_dir.trim() || host != self.host_name.trim();
                 // Only fields the user changed are persisted, so a value that
                 // merely came from the environment doesn't get saved with them.
                 if dir != self.config_dir.trim() {
@@ -490,10 +523,15 @@ impl App {
                 if host != self.host_name.trim() {
                     self.saved.host_name = host.clone();
                 }
+                self.saved.editor = editor.clone();
                 self.config_dir = dir;
                 self.host_name = host;
+                self.editor = editor;
                 self.notice = None;
                 self.persist();
+                if !target_changed {
+                    return Task::none();
+                }
                 // Forget what we knew about the old target.
                 self.status = None;
                 self.store.reset();
@@ -949,6 +987,32 @@ impl App {
     }
 }
 
+/// Starts the editor on the configuration directory and leaves it running on
+/// its own. `editor` is a command line such as `zed` or `code --new-window`.
+fn open_in_editor(editor: &str, config_dir: &str) -> Result<(), String> {
+    let dir = config_dir.strip_prefix("path:").unwrap_or(config_dir);
+    if !std::path::Path::new(dir).is_dir() {
+        return Err(format!("{dir} is not a directory on this machine, so there is nothing to open."));
+    }
+    let mut words = settings::split_command(editor).into_iter();
+    let Some(program) = words.next() else {
+        return Err("No editor is set. Enter one in Settings.".to_owned());
+    };
+    let mut child = std::process::Command::new(&program)
+        .args(words)
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Could not start '{program}': {error}. Set the editor to use in Settings."))?;
+    // Reaped off-thread so it doesn't linger as a zombie when it exits.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Appends the lines in `pending` to the output view and follows them, unless
 /// the pointer is over the view or text is selected in it: new lines would move
 /// what is being read or selected, so they wait until the user is done.
@@ -1061,5 +1125,40 @@ mod tests {
         sync_log(&mut view, &mut pending, false, &log);
         assert_eq!(view.line_count(), MAX_LOG_LINES);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn the_editor_gets_its_arguments_and_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("nix-manager-editor-{}", std::process::id()));
+        let config = root.join("my config");
+        std::fs::create_dir_all(&config).unwrap();
+        let record = root.join("record");
+        let editor = root.join("fake editor");
+        std::fs::write(&editor, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", record.display())).unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let command = format!("'{}' --new-window", editor.display());
+        open_in_editor(&command, config.to_str().unwrap()).unwrap();
+
+        // It runs on its own, so wait for it to have written its arguments.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !record.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let args = std::fs::read_to_string(&record).unwrap();
+        assert_eq!(args.lines().collect::<Vec<_>>(), ["--new-window", config.to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opening_the_config_explains_what_went_wrong() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let missing = open_in_editor("definitely-not-an-editor-xyz", dir).unwrap_err();
+        assert!(missing.contains("definitely-not-an-editor-xyz") && missing.contains("Settings"), "{missing}");
+        assert!(open_in_editor("  ", dir).unwrap_err().contains("No editor"));
+        assert!(open_in_editor("zed", "/no/such/dir").unwrap_err().contains("not a directory"));
     }
 }

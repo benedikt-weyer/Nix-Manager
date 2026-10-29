@@ -8,13 +8,62 @@ use std::{fs, io};
 
 use serde::{Deserialize, Serialize};
 
-/// Empty strings mean "use the backend's default".
+/// The editor that opens the configuration unless another is set.
+pub const DEFAULT_EDITOR: &str = "zed";
+
+/// Empty strings mean "use the default".
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub config_dir: String,
     #[serde(default)]
     pub host_name: String,
+    /// A command line, e.g. `zed` or `code --new-window`; the config directory
+    /// is passed to it as the last argument.
+    #[serde(default)]
+    pub editor: String,
+}
+
+/// Splits a command line into words. Whitespace separates words; single or
+/// double quotes keep one together; a backslash escapes the next character
+/// (except inside single quotes). No variables or globs: this is not a shell.
+pub fn split_command(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), c) => word.push(c),
+            (_, '\\') => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+                started = true;
+            }
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            (_, c) => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
 }
 
 impl Settings {
@@ -65,12 +114,27 @@ mod tests {
     fn round_trips() {
         let dir = scratch("roundtrip");
         let path = dir.join("nested").join("settings.json");
-        let settings = Settings { config_dir: "/home/me/nixos".to_owned(), host_name: "laptop".to_owned() };
+        let settings = Settings {
+            config_dir: "/home/me/nixos".to_owned(),
+            host_name: "laptop".to_owned(),
+            editor: "code --new-window".to_owned(),
+        };
 
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), settings);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn splits_command_lines() {
+        assert_eq!(split_command("zed"), ["zed"]);
+        assert_eq!(split_command("  code   --new-window "), ["code", "--new-window"]);
+        assert_eq!(split_command(r#""/opt/My Editor/edit" --flag 'a b'"#), ["/opt/My Editor/edit", "--flag", "a b"]);
+        assert_eq!(split_command(r"my\ editor"), ["my editor"]);
+        assert_eq!(split_command(r#"echo "say \"hi\"""#), ["echo", r#"say "hi""#]);
+        assert_eq!(split_command(r#"x "" y"#), ["x", "", "y"]);
+        assert!(split_command("   ").is_empty());
     }
 
     #[test]

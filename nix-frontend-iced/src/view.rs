@@ -91,7 +91,9 @@ fn header(app: &App) -> Element<'_, Message> {
         space::horizontal(),
         connection_pill(app),
         match app.page {
-            Page::Dashboard => Element::from(row![refresh_button(app), store_button(), settings_button()].spacing(4)),
+            Page::Dashboard => Element::from(
+                row![open_config_button(app), refresh_button(app), store_button(), settings_button()].spacing(4)
+            ),
             Page::Settings => back_button(Message::CloseSettings),
             Page::Store => back_button(Message::StoreBack),
         },
@@ -141,6 +143,27 @@ fn settings_button<'a>() -> Element<'a, Message> {
         .style(ghost_button)
         .on_press(Message::OpenSettings)
         .into()
+}
+
+fn open_config_button(app: &App) -> Element<'_, Message> {
+    iced::widget::tooltip(
+        button(
+            row![lucide::folder_open().size(15), text("Open config").size(13)].spacing(8).align_y(Alignment::Center),
+        )
+        .padding([10, 14])
+        .style(ghost_button)
+        .on_press(Message::OpenConfig),
+        container(
+            text(format!("Open {} in {}", app.effective_config_dir(), app.effective_editor()))
+                .size(12)
+                .wrapping(Wrapping::WordOrGlyph),
+        )
+        .max_width(480)
+        .padding(8)
+        .style(theme::card),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .into()
 }
 
 fn store_button<'a>() -> Element<'a, Message> {
@@ -286,15 +309,17 @@ fn settings(app: &App) -> Element<'_, Message> {
         .style(ghost_button)
         .on_press_maybe(enabled.then_some(message))
     };
-    let has_values = !app.draft_config_dir.trim().is_empty() || !app.draft_host_name.trim().is_empty();
+    let has_values = !app.draft_config_dir.trim().is_empty()
+        || !app.draft_host_name.trim().is_empty()
+        || !app.draft_editor.trim().is_empty();
 
     container(
         column![
             row![
                 icon_tile(lucide::settings(), ACCENT, 20.0, 42.0, 0.0),
                 column![
-                    text("Target").size(18).font(BOLD),
-                    text("Which flake and host updates and rebuilds operate on. Saved on this machine.")
+                    text("Configuration").size(18).font(BOLD),
+                    text("Which flake and host updates and rebuilds operate on, and the editor that opens it. Saved on this machine.")
                         .size(13)
                         .color(MUTED),
                 ]
@@ -315,6 +340,13 @@ fn settings(app: &App) -> Element<'_, Message> {
                 app.default_host_name.as_deref().unwrap_or(app.effective_host_name()),
                 &app.draft_host_name,
                 Message::DraftHostNameChanged
+            ),
+            field(
+                lucide::pencil(),
+                "Editor command",
+                nix_backend_client::settings::DEFAULT_EDITOR,
+                &app.draft_editor,
+                Message::DraftEditorChanged
             ),
             row![
                 apply,
