@@ -175,7 +175,7 @@ fn ghost_button(_: &iced::Theme, status: button::Status) -> button::Style {
 // -------------------------------------------------------------- overview --
 
 fn overview(app: &App) -> Element<'_, Message> {
-    row![flake_card(app), target_card(app)].spacing(16).into()
+    flake_card(app)
 }
 
 fn flake_card(app: &App) -> Element<'_, Message> {
@@ -227,43 +227,6 @@ fn flake_card(app: &App) -> Element<'_, Message> {
     .padding(20)
     .width(Length::FillPortion(1))
     .height(Length::Fill)
-    .style(theme::card)
-    .into()
-}
-
-fn target_card(app: &App) -> Element<'_, Message> {
-    let line = |icon: Text<'static>, value: &str, is_default: bool| {
-        let mut line = row![
-            icon.size(14).color(MUTED),
-            text(value.to_owned()).size(14).font(Font::MONOSPACE).wrapping(Wrapping::None),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
-        if is_default {
-            line =
-                line.push(container(text("default").size(11).color(MUTED)).padding([2, 8]).style(theme::chip(MUTED)));
-        }
-        line
-    };
-
-    container(
-        column![
-            row![
-                text("Target").size(13).color(MUTED).font(BOLD),
-                space::horizontal(),
-                button(row![lucide::pencil().size(12), text("Edit").size(12)].spacing(6).align_y(Alignment::Center))
-                    .padding([4, 10])
-                    .style(ghost_button)
-                    .on_press(Message::OpenSettings),
-            ]
-            .align_y(Alignment::Center),
-            line(lucide::folder(), app.effective_config_dir(), app.config_dir.trim().is_empty()),
-            line(lucide::server(), app.effective_host_name(), app.host_name.trim().is_empty()),
-        ]
-        .spacing(12),
-    )
-    .padding(20)
-    .width(Length::FillPortion(1))
     .style(theme::card)
     .into()
 }
