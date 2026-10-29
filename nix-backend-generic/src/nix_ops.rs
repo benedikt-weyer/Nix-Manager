@@ -1,4 +1,5 @@
 use std::process::Stdio;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,12 +60,54 @@ async fn forward_line(tx: &EventTx, phase: EventPhase, line: &str, tracker: &Mut
         .await;
 }
 
+/// A line a privileged helper script prints to move the stream on to the next
+/// phase: `@@nix-manager-phase:ACTIVATE:Activating (boot)`. This lets one
+/// authorized process (one polkit prompt) cover several UI phases.
+const PHASE_MARKER: &str = "@@nix-manager-phase:";
+
+/// Registers the built system as the current generation, then activates it,
+/// all under a single `pkexec` so the user authorizes once. Arguments are
+/// positional (never interpolated into the script): $1 nix-env, $2 profile,
+/// $3 built system, $4 switch-to-configuration, $5 switch|boot.
+const REGISTER_AND_ACTIVATE: &str = r#"set -e
+"$1" --profile "$2" --set "$3"
+echo "@@nix-manager-phase:ACTIVATE:Activating ($5)"
+exec "$4" "$5"
+"#;
+
+const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
+
+fn current_phase(phase: &AtomicI32) -> EventPhase {
+    EventPhase::try_from(phase.load(Ordering::Relaxed)).unwrap_or(EventPhase::PhaseUnspecified)
+}
+
+/// Handles one `PHASE_MARKER` payload (`PHASE:message`).
+async fn switch_phase(tx: &EventTx, phase: &AtomicI32, payload: &str) {
+    let (name, message) = payload.split_once(':').unwrap_or((payload, ""));
+    if let Some(next) = EventPhase::from_str_name(name) {
+        phase.store(next as i32, Ordering::Relaxed);
+        send(tx, next, message, false).await;
+    }
+}
+
+fn find_in_path(name: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file()).map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Runs a command to completion, streaming every stdout/stderr line as a
 /// `ProgressEvent` tagged with `phase` as it's produced (not buffered until
 /// exit) so the UI's log view fills in live. Also feeds every line through a
 /// fresh `ActivityTracker`, so each `ProgressEvent` carries a current
 /// snapshot of what nix is actually building/downloading right now.
 async fn run_streamed(program: &str, args: &[&str], phase: EventPhase, tx: &EventTx) -> anyhow::Result<()> {
+    run_phased(program, args, Arc::new(AtomicI32::new(phase as i32)), tx).await
+}
+
+/// Like [`run_streamed`], but the phase can change mid-run (see
+/// [`PHASE_MARKER`]); `phase` holds the current one, so the caller can tell
+/// afterwards which step a failure happened in.
+async fn run_phased(program: &str, args: &[&str], phase: Arc<AtomicI32>, tx: &EventTx) -> anyhow::Result<()> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -80,19 +123,25 @@ async fn run_streamed(program: &str, args: &[&str], phase: EventPhase, tx: &Even
 
     let tx_out = tx.clone();
     let tracker_out = tracker.clone();
+    let phase_out = phase.clone();
     let out_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            forward_line(&tx_out, phase, &line, &tracker_out).await;
+            if let Some(payload) = line.strip_prefix(PHASE_MARKER) {
+                switch_phase(&tx_out, &phase_out, payload).await;
+                continue;
+            }
+            forward_line(&tx_out, current_phase(&phase_out), &line, &tracker_out).await;
         }
     });
 
     let tx_err = tx.clone();
     let tracker_err = tracker.clone();
+    let phase_err = phase.clone();
     let err_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            forward_line(&tx_err, phase, &line, &tracker_err).await;
+            forward_line(&tx_err, current_phase(&phase_err), &line, &tracker_err).await;
         }
     });
 
@@ -101,7 +150,12 @@ async fn run_streamed(program: &str, args: &[&str], phase: EventPhase, tx: &Even
     let _ = err_task.await;
 
     if !status.success() {
-        anyhow::bail!("{program} {} exited with {status}", args.join(" "));
+        // Keep the message readable when an argument is a whole script.
+        let mut command = format!("{program} {}", args.join(" "));
+        if command.chars().count() > 160 {
+            command = format!("{}…", command.chars().take(160).collect::<String>());
+        }
+        anyhow::bail!("{command} exited with {status}");
     }
     Ok(())
 }
@@ -216,26 +270,41 @@ pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, tx: EventTx) {
         return;
     }
 
-    if mode != RebuildMode::Test {
-        send(&tx, EventPhase::Register, "Registering system generation (authorization required)", false).await;
-        if let Err(e) = run_streamed(
-            "pkexec",
-            &["nix-env", "--profile", "/nix/var/nix/profiles/system", "--set", &resolved],
+    let switch_bin = format!("{resolved}/bin/switch-to-configuration");
+    let phase = Arc::new(AtomicI32::new(EventPhase::Register as i32));
+
+    let outcome = if mode == RebuildMode::Test {
+        // Nothing to register; activation alone is one authorization.
+        phase.store(EventPhase::Activate as i32, Ordering::Relaxed);
+        send(&tx, EventPhase::Activate, format!("Activating ({action}, authorization required)"), false).await;
+        run_phased("pkexec", &[&switch_bin, action], phase.clone(), &tx).await
+    } else {
+        // Registering and activating share one pkexec, so a single
+        // authorization covers both.
+        let Some(nix_env) = find_in_path("nix-env") else {
+            send(&tx, EventPhase::Failed, "Could not find nix-env in PATH", true).await;
+            let _ = tokio::fs::remove_file(&out_link).await;
+            return;
+        };
+        send(
+            &tx,
             EventPhase::Register,
+            format!("Registering system generation, then activating ({action}) - one authorization covers both"),
+            false,
+        )
+        .await;
+        run_phased(
+            "pkexec",
+            &["sh", "-c", REGISTER_AND_ACTIVATE, "sh", &nix_env, SYSTEM_PROFILE, &resolved, &switch_bin, action],
+            phase.clone(),
             &tx,
         )
         .await
-        {
-            send(&tx, EventPhase::Failed, format!("Registering system generation failed: {e}"), true).await;
-            let _ = tokio::fs::remove_file(&out_link).await;
-            return;
-        }
-    }
+    };
 
-    let switch_bin = format!("{resolved}/bin/switch-to-configuration");
-    send(&tx, EventPhase::Activate, format!("Activating ({action}, authorization required)"), false).await;
-    if let Err(e) = run_streamed("pkexec", &[&switch_bin, action], EventPhase::Activate, &tx).await {
-        send(&tx, EventPhase::Failed, format!("Activation failed: {e}"), true).await;
+    if let Err(e) = outcome {
+        let step = if current_phase(&phase) == EventPhase::Register { "Registering system generation" } else { "Activation" };
+        send(&tx, EventPhase::Failed, format!("{step} failed: {e}"), true).await;
         let _ = tokio::fs::remove_file(&out_link).await;
         return;
     }
@@ -293,4 +362,82 @@ pub async fn flake_status(target: &ResolvedTarget) -> FlakeStatusReply {
     reply.resolved_config_dir = target.config_dir.clone();
     reply.resolved_host_name = target.host_name.clone();
     reply
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command as StdCommand;
+
+    fn fake(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn run_script(nix_env_body: &str) -> (bool, String) {
+        let dir = std::env::temp_dir().join(format!("nix-ops-test-{}-{}", std::process::id(), nix_env_body.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nix_env = fake(&dir, "nix-env", nix_env_body);
+        let switch = fake(&dir, "switch-to-configuration", r#"echo "switching: $1""#);
+        let out = StdCommand::new("sh")
+            .args(["-c", REGISTER_AND_ACTIVATE, "sh", &nix_env, "/profile", "/store/system", &switch, "boot"])
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn registers_then_marks_activation_then_activates() {
+        let (ok, stdout) = run_script(r#"echo "registered $*""#);
+        assert!(ok);
+        let lines: Vec<_> = stdout.lines().collect();
+        assert_eq!(lines[0], "registered --profile /profile --set /store/system");
+        assert_eq!(lines[1], "@@nix-manager-phase:ACTIVATE:Activating (boot)");
+        assert_eq!(lines[2], "switching: boot");
+    }
+
+    #[test]
+    fn failed_registration_never_activates() {
+        let (ok, stdout) = run_script("exit 3");
+        assert!(!ok);
+        assert!(!stdout.contains("ACTIVATE") && !stdout.contains("switching"));
+    }
+
+    #[tokio::test]
+    async fn marker_moves_the_stream_from_register_to_activate() {
+        let dir = std::env::temp_dir().join(format!("nix-ops-test-phase-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let nix_env = fake(&dir, "nix-env", r#"echo "registered""#);
+        let switch = fake(&dir, "switch-to-configuration", r#"echo "switching: $1""#);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let phase = Arc::new(AtomicI32::new(EventPhase::Register as i32));
+        let args = ["-c", REGISTER_AND_ACTIVATE, "sh", &nix_env, "/profile", "/store/system", &switch, "boot"];
+        run_phased("sh", &args, phase.clone(), &tx).await.unwrap();
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut events = Vec::new();
+        while let Some(Ok(event)) = rx.recv().await {
+            events.push((event.phase(), event.message));
+        }
+        assert_eq!(
+            events,
+            vec![
+                (EventPhase::Register, "registered".to_owned()),
+                (EventPhase::Activate, "Activating (boot)".to_owned()),
+                (EventPhase::Activate, "switching: boot".to_owned()),
+            ]
+        );
+        assert_eq!(current_phase(&phase), EventPhase::Activate);
+    }
+
+    #[test]
+    fn marker_names_a_known_phase() {
+        assert_eq!(EventPhase::from_str_name("ACTIVATE"), Some(EventPhase::Activate));
+    }
 }

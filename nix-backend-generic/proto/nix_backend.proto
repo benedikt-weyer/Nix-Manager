@@ -13,8 +13,10 @@ service NixBackend {
 
     // Builds the named nixosConfiguration, diffs it against the running
     // system, then (unless mode is BUILD_ONLY or TEST) registers it as a system
-    // generation and (unless mode is BUILD_ONLY) activates it. Each privileged step is authorized individually via
-    // polkit (pkexec) - the daemon itself never runs as root.
+    // generation and (unless mode is BUILD_ONLY) activates it. The privileged
+    // steps go through polkit (pkexec) - the daemon itself never runs as root.
+    // SWITCH and BOOT register and activate under a single authorization, TEST
+    // activates under one, BUILD_ONLY needs none.
     rpc Rebuild(RebuildRequest) returns (stream ProgressEvent);
 
     // Reports when the flake was last changed, from git history.
