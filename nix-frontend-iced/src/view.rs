@@ -216,7 +216,7 @@ fn flake_card(app: &App) -> Element<'_, Message> {
 
             column![
                 text(headline).size(18).font(BOLD),
-                text(status.last_commit_subject.clone()).size(13).color(MUTED).wrapping(Wrapping::None),
+                clipped(text(status.last_commit_subject.clone()).size(13).color(MUTED)),
                 row![
                     container(text(hash).size(12).font(Font::MONOSPACE).color(ACCENT))
                         .padding([3, 8])
@@ -227,6 +227,7 @@ fn flake_card(app: &App) -> Element<'_, Message> {
                 .align_y(Alignment::Center),
             ]
             .spacing(6)
+            .width(Length::Fill)
             .into()
         }
     };
@@ -476,7 +477,7 @@ fn activity<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
         column![
             text(run_title(run)).size(17).font(BOLD),
             row![
-                text(run.message.clone()).size(13).color(MUTED).wrapping(Wrapping::None).width(Length::Fill),
+                status_line(&run.message),
                 if run.message.is_empty() {
                     Element::from(space::horizontal().width(0))
                 } else {
@@ -711,7 +712,7 @@ fn items<'a>(app: &'a App, run: &'a Run, fx: &Fx) -> Element<'a, Message> {
         };
         let mut entry = column![row![
             icon.size(13).color(tint),
-            text(item.name.clone()).size(13).font(Font::MONOSPACE).width(Length::Fill).wrapping(Wrapping::None),
+            clipped(text(item.name.clone()).size(13).font(Font::MONOSPACE)),
             text(detail).size(12).color(MUTED),
         ]
         .spacing(10)
@@ -831,6 +832,31 @@ fn visible_rows(total: usize, from_bottom: f32) -> (usize, usize) {
 }
 
 // --------------------------------------------------------------- helpers --
+
+/// One line of text that is cut off at the edge of the space it is given, where
+/// plain non-wrapping text would spill over whatever is next to it.
+pub(crate) fn clipped<'a>(line: Text<'a>) -> Element<'a, Message> {
+    container(line.wrapping(Wrapping::None)).width(Length::Fill).clip(true).into()
+}
+
+/// The status of a running operation. Nix messages can be far longer than the
+/// window (store paths, flake references), so the line is cut off and hovering
+/// it shows everything.
+fn status_line(message: &str) -> Element<'_, Message> {
+    let line = clipped(text(message.to_owned()).size(13).color(MUTED));
+    if message.is_empty() {
+        return line;
+    }
+    iced::widget::tooltip(
+        line,
+        container(text(message.to_owned()).size(12).wrapping(Wrapping::WordOrGlyph))
+            .max_width(640)
+            .padding(8)
+            .style(theme::card),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .into()
+}
 
 /// A ghost button that copies `target` and turns into a green "Copied" for a
 /// moment (driven by the `Fx` flash) as confirmation.

@@ -4,13 +4,13 @@
 
 use std::collections::HashSet;
 
-use iced::widget::{button, column, container, pick_list, row, space, text, text::Wrapping, text_input, Text};
+use iced::widget::{button, column, container, pick_list, row, space, text, text_input, Text};
 use iced::{Alignment, Background, Border, Color, Element, Font, Length};
 use iced_fonts::lucide;
 use nix_backend_client::{Destination, Maintainer, Package, SearchPackagesReply};
 
 use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEXT, WARNING};
-use crate::view::{bar, centered_icon, copy_button, ghost_button, icon_tile, BOLD};
+use crate::view::{bar, centered_icon, clipped, copy_button, ghost_button, icon_tile, BOLD};
 use crate::{App, Conn, CopyTarget, Message};
 
 /// The id of the search box, so opening the page can put the cursor in it.
@@ -619,9 +619,7 @@ fn entry<'a>(
         button(
             row![
                 icon_tile(lucide::package(), ACCENT_ALT, 16.0, 36.0, 0.0),
-                column![name, text(description).size(13).color(MUTED).wrapping(Wrapping::None)]
-                    .spacing(2)
-                    .width(Length::Fill),
+                column![name, clipped(text(description).size(13).color(MUTED))].spacing(2).width(Length::Fill),
                 lucide::chevron_right().size(14).color(MUTED),
             ]
             .spacing(14)
