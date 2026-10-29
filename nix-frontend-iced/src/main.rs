@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use iced::{window, Subscription, Task};
+use nix_backend_client::settings::Settings;
 use nix_backend_client::{
     BuildItem, BuildStats, Client, EventPhase, FlakeStatusReply, OperationEvent, OperationKind, ProgressEvent,
     RebuildMode, SystemTarget,
@@ -129,9 +130,15 @@ pub struct App {
     pub conn: Conn,
     pub config_dir: String,
     pub host_name: String,
+    /// What the backend falls back to when a field is empty, once it has said.
+    pub default_config_dir: Option<String>,
+    pub default_host_name: Option<String>,
+    /// Only what the user typed - not values that came from the environment.
+    saved: Settings,
     pub status: Option<Result<FlakeStatusReply, String>>,
     pub run: Option<Run>,
     pub notice: Option<String>,
+    local_hostname: String,
     pub show_log: bool,
     pub copied: Option<CopyTarget>,
     pub fx: Fx,
@@ -146,7 +153,7 @@ pub enum Message {
     Watch(Result<OperationEvent, String>),
     WatchEnded,
     RefreshStatus,
-    StatusLoaded(Result<FlakeStatusReply, String>),
+    StatusLoaded(SystemTarget, Result<FlakeStatusReply, String>),
     ConfigDirChanged(String),
     HostNameChanged(String),
     Start(Action),
@@ -182,13 +189,25 @@ fn watch(mut client: Client) -> Task<Message> {
 
 impl App {
     fn new() -> (Self, Task<Message>) {
+        let saved = Settings::load();
+        // An explicit environment (e.g. `./scripts/run -c DIR`) beats what was saved.
+        let from_env = |name: &str, saved: &str| match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => saved.to_owned(),
+        };
         let app = Self {
             conn: Conn::Connecting,
-            config_dir: std::env::var("NIX_BACKEND_CONFIG_DIR").unwrap_or_default(),
-            host_name: std::env::var("NIX_BACKEND_HOST_NAME").unwrap_or_default(),
+            config_dir: from_env("NIX_BACKEND_CONFIG_DIR", &saved.config_dir),
+            host_name: from_env("NIX_BACKEND_HOST_NAME", &saved.host_name),
+            default_config_dir: None,
+            default_host_name: None,
+            saved,
             status: None,
             run: None,
             notice: None,
+            local_hostname: std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .map(|name| name.trim().to_owned())
+                .unwrap_or_default(),
             show_log: true,
             copied: None,
             fx: Fx::new(),
@@ -199,6 +218,29 @@ impl App {
 
     pub fn target(&self) -> SystemTarget {
         SystemTarget { config_dir: self.config_dir.trim().to_owned(), host_name: self.host_name.trim().to_owned() }
+    }
+
+    /// The directory that will be used: what was typed, else the backend's default.
+    pub fn effective_config_dir(&self) -> &str {
+        match self.config_dir.trim() {
+            "" => self.default_config_dir.as_deref().unwrap_or("/etc/nixos"),
+            typed => typed,
+        }
+    }
+
+    /// The host that will be used: what was typed, else the backend's default,
+    /// else (before the backend has answered) this machine's hostname.
+    pub fn effective_host_name(&self) -> &str {
+        match self.host_name.trim() {
+            "" => self.default_host_name.as_deref().unwrap_or(&self.local_hostname),
+            typed => typed,
+        }
+    }
+
+    fn persist(&mut self) {
+        if let Err(error) = self.saved.save() {
+            self.notice = Some(format!("Could not save settings: {error}"));
+        }
     }
 
     pub fn busy(&self) -> bool {
@@ -217,7 +259,13 @@ impl App {
             return Task::none();
         };
         let target = self.target();
-        Task::perform(async move { client.flake_status(target).await.map_err(status_text) }, Message::StatusLoaded)
+        Task::perform(
+            async move {
+                let result = client.flake_status(target.clone()).await.map_err(status_text);
+                (target, result)
+            },
+            |(target, result)| Message::StatusLoaded(target, result),
+        )
     }
 
     fn go_offline(&mut self, reason: String) {
@@ -278,16 +326,30 @@ impl App {
                 self.status = None;
                 self.load_status()
             }
-            Message::StatusLoaded(status) => {
+            Message::StatusLoaded(requested, status) => {
+                // What "default" means is only known for fields the request
+                // left empty; otherwise the reply just echoes what we sent.
+                if let Ok(reply) = &status {
+                    if requested.config_dir.is_empty() {
+                        self.default_config_dir = Some(reply.resolved_config_dir.clone());
+                    }
+                    if requested.host_name.is_empty() {
+                        self.default_host_name = Some(reply.resolved_host_name.clone());
+                    }
+                }
                 self.status = Some(status);
                 Task::none()
             }
             Message::ConfigDirChanged(value) => {
+                self.saved.config_dir = value.trim().to_owned();
                 self.config_dir = value;
+                self.persist();
                 Task::none()
             }
             Message::HostNameChanged(value) => {
+                self.saved.host_name = value.trim().to_owned();
                 self.host_name = value;
+                self.persist();
                 Task::none()
             }
             Message::Start(action) => {

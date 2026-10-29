@@ -68,6 +68,11 @@ message FlakeStatusReply {
     string last_modified_iso8601 = 2;
     string last_commit_subject = 3;
     string last_commit_hash = 4;
+    // The target that was actually used, after falling back to the daemon's
+    // own defaults for whatever the request left empty - so a frontend can
+    // show what "default" means.
+    string resolved_config_dir = 5;
+    string resolved_host_name = 6;
 }
 
 enum EventPhase {

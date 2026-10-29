@@ -7,6 +7,8 @@
 // tonic::Status is large and every tonic call returns it.
 #![allow(clippy::result_large_err)]
 
+pub mod settings;
+
 use std::path::{Path, PathBuf};
 
 use tonic::transport::{Channel, Endpoint, Uri};

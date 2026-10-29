@@ -257,13 +257,17 @@ pub async fn flake_status(target: &ResolvedTarget) -> FlakeStatusReply {
         None => git_log_one(&target.config_dir, None).await,
     };
 
-    match found {
+    let mut reply = match found {
         Some((hash, date, subject)) => FlakeStatusReply {
             has_git_history: true,
             last_modified_iso8601: date,
             last_commit_subject: subject,
             last_commit_hash: hash,
+            ..Default::default()
         },
         None => FlakeStatusReply::default(),
-    }
+    };
+    reply.resolved_config_dir = target.config_dir.clone();
+    reply.resolved_host_name = target.host_name.clone();
+    reply
 }

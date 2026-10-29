@@ -65,11 +65,9 @@ fn reveal<'a>(fx: &Fx, slot: Slot, content: impl Into<Element<'a, Message>>) -> 
 // ---------------------------------------------------------------- header --
 
 fn header(app: &App) -> Element<'_, Message> {
-    let subtitle = match (app.config_dir.trim(), app.host_name.trim()) {
-        ("", "") => "Manage your NixOS system".to_owned(),
-        (dir, "") => dir.to_owned(),
-        ("", host) => host.to_owned(),
-        (dir, host) => format!("{host}  ·  {dir}"),
+    let subtitle = match app.effective_host_name() {
+        "" => app.effective_config_dir().to_owned(),
+        host => format!("{host}  ·  {}", app.effective_config_dir()),
     };
 
     row![
@@ -201,36 +199,35 @@ fn flake_card(app: &App) -> Element<'_, Message> {
 }
 
 fn target_card(app: &App) -> Element<'_, Message> {
-    let field = |icon: Text<'static>,
-                 label: &'static str,
-                 placeholder: &'static str,
-                 value: &str,
-                 on_input: fn(String) -> Message| {
-        column![
-            row![icon.size(13).color(MUTED), text(label).size(12).color(MUTED)].spacing(6).align_y(Alignment::Center),
-            text_input(placeholder, value)
-                .on_input(on_input)
-                .on_submit(Message::RefreshStatus)
-                .padding(10)
-                .size(14)
-                .style(theme::input),
-        ]
-        .spacing(6)
-    };
+    let field =
+        |icon: Text<'static>, label: &'static str, placeholder: &str, value: &str, on_input: fn(String) -> Message| {
+            column![
+                row![icon.size(13).color(MUTED), text(label).size(12).color(MUTED)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                text_input(placeholder, value)
+                    .on_input(on_input)
+                    .on_submit(Message::RefreshStatus)
+                    .padding(10)
+                    .size(14)
+                    .style(theme::input),
+            ]
+            .spacing(6)
+        };
 
     container(
         column![
             field(
                 lucide::folder(),
                 "Config directory",
-                "Backend default (/etc/nixos)",
+                &format!("Default: {}", app.effective_config_dir()),
                 &app.config_dir,
                 Message::ConfigDirChanged
             ),
             field(
                 lucide::server(),
                 "Host name",
-                "Backend default (this machine)",
+                &format!("Default: {}", app.effective_host_name()),
                 &app.host_name,
                 Message::HostNameChanged
             ),
