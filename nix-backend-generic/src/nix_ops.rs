@@ -45,6 +45,13 @@ async fn forward_line(tx: &EventTx, phase: EventPhase, line: &str, tracker: &Mut
         None => Some(line.to_owned()),
     };
 
+    // Evaluating a big config makes nix log one "evaluating file '...'" line
+    // per file - tens of thousands. They say nothing useful and would flood
+    // every client, so they are not forwarded.
+    if message.as_deref().is_some_and(|m| m.starts_with("evaluating file '")) {
+        return;
+    }
+
     let (active_items, stats) = tracker.lock().unwrap_or_else(|e| e.into_inner()).snapshot();
     let fraction = activity::fraction_done(&stats);
 

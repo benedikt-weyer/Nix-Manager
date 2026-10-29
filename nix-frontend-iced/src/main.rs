@@ -2,6 +2,7 @@ mod fx;
 mod theme;
 mod view;
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -113,7 +114,7 @@ pub struct Run {
     pub fraction: Option<f32>,
     pub stats: Option<BuildStats>,
     pub items: Vec<BuildItem>,
-    pub log: Vec<LogLine>,
+    pub log: VecDeque<LogLine>,
 }
 
 impl Run {
@@ -127,7 +128,7 @@ impl Run {
             fraction: None,
             stats: None,
             items: Vec::new(),
-            log: Vec::new(),
+            log: VecDeque::new(),
         }
     }
 
@@ -168,6 +169,9 @@ pub struct App {
     pub notice: Option<String>,
     local_hostname: String,
     pub show_log: bool,
+    /// How far the output view is scrolled up from its bottom, in px (0 =
+    /// following the newest line). The view only draws the rows around it.
+    pub log_from_bottom: f32,
     pub copied: Option<CopyTarget>,
     pub fx: Fx,
     last_frame: Option<Instant>,
@@ -193,6 +197,7 @@ pub enum Message {
     StartRejected(String),
     Hover(usize, bool),
     ToggleLog,
+    LogScrolled(f32),
     Copy(CopyTarget),
     DismissRun,
     DismissNotice,
@@ -245,6 +250,7 @@ impl App {
                 .map(|name| name.trim().to_owned())
                 .unwrap_or_default(),
             show_log: true,
+            log_from_bottom: 0.0,
             copied: None,
             fx: Fx::new(),
             last_frame: None,
@@ -476,6 +482,12 @@ impl App {
             }
             Message::ToggleLog => {
                 self.show_log = !self.show_log;
+                // A freshly shown scrollable starts at its bottom.
+                self.log_from_bottom = 0.0;
+                Task::none()
+            }
+            Message::LogScrolled(from_bottom) => {
+                self.log_from_bottom = from_bottom;
                 Task::none()
             }
             Message::Copy(target) => {
@@ -520,6 +532,7 @@ impl App {
         // to us as a late joiner.
         if self.run.as_ref().is_none_or(|run| !run.running()) {
             self.run = Some(Run::new(kind, mode));
+            self.log_from_bottom = 0.0;
             self.fx.reset_progress();
             self.fx.restart(Slot::Activity, 0.0);
         }
@@ -530,9 +543,12 @@ impl App {
         let message = nix_backend_client::strip_ansi(&event.message);
         if !message.is_empty() {
             run.message = message.lines().next().unwrap_or_default().to_owned();
-            run.log.push(LogLine { phase, text: message.clone(), is_error: event.is_error });
-            if run.log.len() > MAX_LOG_LINES {
-                run.log.drain(..run.log.len() - MAX_LOG_LINES);
+            // One row per line: the output view relies on fixed-height rows.
+            for line in message.lines() {
+                run.log.push_back(LogLine { phase, text: line.to_owned(), is_error: event.is_error });
+                if run.log.len() > MAX_LOG_LINES {
+                    run.log.pop_front();
+                }
             }
         }
         absorb_progress(run, &event, &mut self.fx);

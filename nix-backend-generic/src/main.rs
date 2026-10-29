@@ -36,7 +36,7 @@ struct Hub {
 
 impl Hub {
     fn new() -> Arc<Self> {
-        Arc::new(Self { running: Mutex::new(None), events: broadcast::channel(256).0 })
+        Arc::new(Self { running: Mutex::new(None), events: broadcast::channel(1024).0 })
     }
 
     /// Claims the single operation slot.
@@ -133,8 +133,9 @@ impl NixBackend for Service {
 
     async fn watch(&self, _request: Request<WatchRequest>) -> Result<Response<Self::WatchStream>, Status> {
         let (rx, snapshot) = self.hub.subscribe();
-        // A subscriber that falls too far behind just skips the missed events;
-        // the next one carries a full snapshot of what's active anyway.
+        // A subscriber that falls too far behind skips the oldest events it
+        // missed and carries on with the newest ones (so it still sees the
+        // terminal event); every event carries a full snapshot anyway.
         let live = BroadcastStream::new(rx).filter_map(|item| item.ok().map(Ok));
         let stream = tokio_stream::iter(snapshot.into_iter().map(Ok)).chain(live);
         Ok(Response::new(Box::pin(stream)))

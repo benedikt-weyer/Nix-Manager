@@ -14,6 +14,13 @@ use crate::fx::{Fx, Slot, SLIDE};
 use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
 use crate::{Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
 
+/// The output view: fixed row height and viewport height let it draw only the
+/// rows that are visible.
+const LOG_ROW_HEIGHT: f32 = 18.0;
+const LOG_VIEW_HEIGHT: f32 = 220.0;
+/// Extra rows built above and below the viewport so scrolling never shows a gap.
+const LOG_OVERSCAN: usize = 4;
+
 const BOLD: Font = Font { weight: font::Weight::Semibold, ..Font::DEFAULT };
 
 pub fn view(app: &App) -> Element<'_, Message> {
@@ -751,24 +758,56 @@ fn log<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
         return header.into();
     }
 
-    let lines = run.log.iter().map(|line| {
+    // Virtualised: every row is exactly `LOG_ROW_HEIGHT` tall, so which rows
+    // are on screen follows from the scroll position alone. Only those (plus
+    // a little overscan) are built and laid out; two spacers stand in for the
+    // rest so the scrollbar still reflects the whole log.
+    let total = run.log.len();
+    let (first, last) = visible_rows(total, app.log_from_bottom);
+
+    let mut rows = column![space::vertical().height(first as f32 * LOG_ROW_HEIGHT)];
+    for line in run.log.iter().skip(first).take(last.saturating_sub(first)) {
         let color = if line.is_error { DANGER } else { TEXT };
-        row![
-            text(phase_label(line.phase)).size(11).font(Font::MONOSPACE).color(theme::with_alpha(MUTED, 0.8)).width(66),
-            text(line.text.clone()).size(12).font(Font::MONOSPACE).color(color),
-        ]
-        .spacing(10)
-        .into()
-    });
+        rows = rows.push(
+            row![
+                text(phase_label(line.phase))
+                    .size(11)
+                    .font(Font::MONOSPACE)
+                    .color(theme::with_alpha(MUTED, 0.8))
+                    .width(66),
+                text(line.text.clone()).size(12).font(Font::MONOSPACE).color(color).wrapping(Wrapping::None),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .height(LOG_ROW_HEIGHT),
+        );
+    }
+    rows = rows.push(space::vertical().height(total.saturating_sub(last) as f32 * LOG_ROW_HEIGHT));
 
     column![
         header,
-        container(scrollable(column(lines).spacing(2).padding(12).width(Length::Fill)).anchor_bottom().height(220))
-            .width(Length::Fill)
-            .style(theme::well),
+        container(
+            scrollable(rows.padding([0, 4]).width(Length::Fill))
+                .anchor_bottom()
+                .on_scroll(|viewport| Message::LogScrolled(viewport.absolute_offset().y))
+                .height(LOG_VIEW_HEIGHT),
+        )
+        .padding(8)
+        .width(Length::Fill)
+        .style(theme::well),
     ]
     .spacing(8)
     .into()
+}
+
+/// The range of log rows to build, given how many there are and how far the
+/// view is scrolled up from its bottom (px): the visible ones plus overscan.
+fn visible_rows(total: usize, from_bottom: f32) -> (usize, usize) {
+    let content_height = total as f32 * LOG_ROW_HEIGHT;
+    let top = (content_height - LOG_VIEW_HEIGHT - from_bottom).max(0.0);
+    let first = ((top / LOG_ROW_HEIGHT) as usize).saturating_sub(LOG_OVERSCAN).min(total);
+    let last = (((top + LOG_VIEW_HEIGHT) / LOG_ROW_HEIGHT).ceil() as usize + LOG_OVERSCAN).min(total);
+    (first, last)
 }
 
 // --------------------------------------------------------------- helpers --
@@ -812,4 +851,44 @@ fn relative(then: DateTime<Utc>) -> String {
         _ => (seconds / 31_536_000, "year"),
     };
     format!("{value} {unit}{} ago", if value == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows that fit the viewport.
+    const VISIBLE: usize = (LOG_VIEW_HEIGHT / LOG_ROW_HEIGHT) as usize + 1;
+
+    #[test]
+    fn short_logs_are_drawn_whole() {
+        assert_eq!(visible_rows(0, 0.0), (0, 0));
+        assert_eq!(visible_rows(5, 0.0), (0, 5));
+    }
+
+    #[test]
+    fn following_the_bottom_draws_only_the_tail() {
+        let (first, last) = visible_rows(2000, 0.0);
+        assert_eq!(last, 2000);
+        assert!(first >= 2000 - VISIBLE - LOG_OVERSCAN - 1, "first = {first}");
+        assert!(last - first <= VISIBLE + 2 * LOG_OVERSCAN + 1);
+    }
+
+    #[test]
+    fn scrolled_to_the_top_draws_only_the_head() {
+        let from_bottom = 2000.0 * LOG_ROW_HEIGHT - LOG_VIEW_HEIGHT;
+        let (first, last) = visible_rows(2000, from_bottom);
+        assert_eq!(first, 0);
+        assert!((VISIBLE..=VISIBLE + LOG_OVERSCAN + 1).contains(&last), "last = {last}");
+    }
+
+    #[test]
+    fn mid_scroll_window_covers_the_viewport() {
+        // 100 rows scrolled so row 50 is at the top of the viewport.
+        let top_row = 50.0;
+        let from_bottom = 100.0 * LOG_ROW_HEIGHT - LOG_VIEW_HEIGHT - top_row * LOG_ROW_HEIGHT;
+        let (first, last) = visible_rows(100, from_bottom);
+        assert!(first <= 50 && last >= 50 + VISIBLE - 1, "({first}, {last})");
+        assert!(last - first <= VISIBLE + 2 * LOG_OVERSCAN + 1);
+    }
 }
