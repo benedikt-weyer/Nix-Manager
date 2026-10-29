@@ -28,6 +28,7 @@ const ENTRANCE_SECONDS: f32 = 0.55;
 const STAGGER_SECONDS: f32 = 0.08;
 const HOVER_SETTLE_SECONDS: f32 = 0.35;
 const BAR_SECONDS: f32 = 0.5;
+const FLASH_SECONDS: f32 = 1.4;
 
 #[derive(Animate, Clone, Debug, Default, PartialEq)]
 pub struct Entrance {
@@ -63,6 +64,11 @@ pub struct Sweep {
 }
 
 #[derive(Animate, Clone, Debug, Default, PartialEq)]
+pub struct Flash {
+    pub strength: f32,
+}
+
+#[derive(Animate, Clone, Debug, Default, PartialEq)]
 pub struct Dot {
     pub alpha: f32,
 }
@@ -84,6 +90,8 @@ pub struct Fx {
     pulse: PulseTimeline,
     sweep: SweepTimeline,
     dot: DotTimeline,
+    flash: FlashTimeline,
+    flash_start: f32,
     looping: bool,
 }
 
@@ -108,6 +116,10 @@ impl Fx {
                 30% { alpha: 1.0 }
                 60% { alpha: 0.2 }
                 to { alpha: 0.2 }),
+            flash: timeline!(Flash 1.4s Easing::OutCubic
+                from { strength: 1.0 }
+                to { strength: 0.0 }),
+            flash_start: f32::NEG_INFINITY,
             looping: false,
         };
 
@@ -158,6 +170,11 @@ impl Fx {
         self.looping = looping;
     }
 
+    /// Starts the short "copied" confirmation.
+    pub fn flash(&mut self) {
+        self.flash_start = self.clock;
+    }
+
     pub fn set_hover(&mut self, index: usize, over: bool) {
         self.hovers[index].set_state(if over { &HoverState::Over } else { &HoverState::Idle });
         self.hover_settle[index] = HOVER_SETTLE_SECONDS;
@@ -193,6 +210,7 @@ impl Fx {
             || self.reveals.iter().any(|r| self.clock < r.end)
             || self.hover_settle.iter().any(|s| *s > 0.0)
             || self.clock - self.bar_start < BAR_SECONDS
+            || self.clock - self.flash_start < FLASH_SECONDS
     }
 
     pub fn entrance(&self, slot: Slot) -> Entrance {
@@ -208,6 +226,17 @@ impl Fx {
 
     pub fn progress(&self) -> f32 {
         self.bar_value
+    }
+
+    /// 1 -> 0 over the confirmation after a copy; exactly 0 once it is over.
+    pub fn copy_flash(&self) -> f32 {
+        let elapsed = self.clock - self.flash_start;
+        if elapsed >= FLASH_SECONDS {
+            return 0.0;
+        }
+        let mut value = Flash { strength: 0.0 };
+        self.flash.update(&mut value, elapsed.max(0.0));
+        value.strength
     }
 
     /// 0.25..1, breathing.

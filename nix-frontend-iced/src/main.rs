@@ -50,6 +50,15 @@ impl Action {
     ];
 }
 
+/// What a copy button puts on the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CopyTarget {
+    /// The status message (the full error text when the run failed).
+    Message,
+    /// The whole output log.
+    Output,
+}
+
 pub enum Conn {
     Connecting,
     Online(Client),
@@ -124,6 +133,7 @@ pub struct App {
     pub run: Option<Run>,
     pub notice: Option<String>,
     pub show_log: bool,
+    pub copied: Option<CopyTarget>,
     pub fx: Fx,
     last_frame: Option<Instant>,
 }
@@ -143,6 +153,7 @@ pub enum Message {
     StartRejected(String),
     Hover(usize, bool),
     ToggleLog,
+    Copy(CopyTarget),
     DismissRun,
     DismissNotice,
 }
@@ -179,6 +190,7 @@ impl App {
             run: None,
             notice: None,
             show_log: true,
+            copied: None,
             fx: Fx::new(),
             last_frame: None,
         };
@@ -312,6 +324,22 @@ impl App {
             Message::ToggleLog => {
                 self.show_log = !self.show_log;
                 Task::none()
+            }
+            Message::Copy(target) => {
+                let Some(run) = &self.run else { return Task::none() };
+                let text = match target {
+                    CopyTarget::Message => match &run.outcome {
+                        Outcome::Failed(message) => message.clone(),
+                        _ => run.message.clone(),
+                    },
+                    CopyTarget::Output => run.log.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n"),
+                };
+                if text.is_empty() {
+                    return Task::none();
+                }
+                self.copied = Some(target);
+                self.fx.flash();
+                iced::clipboard::write(text)
             }
             Message::DismissRun => {
                 if !self.busy() {

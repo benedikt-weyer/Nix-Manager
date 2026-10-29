@@ -12,7 +12,7 @@ use nix_backend_client::{
 
 use crate::fx::{Fx, Slot, SLIDE};
 use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
-use crate::{Action, App, Conn, Message, Outcome, Run};
+use crate::{Action, App, Conn, CopyTarget, Message, Outcome, Run};
 
 const BOLD: Font = Font { weight: font::Weight::Semibold, ..Font::DEFAULT };
 
@@ -384,7 +384,16 @@ fn activity<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
         icon_tile(state_icon, tint, 20.0, 42.0, strength),
         column![
             text(run_title(run)).size(17).font(BOLD),
-            text(run.message.clone()).size(13).color(MUTED).wrapping(Wrapping::None),
+            row![
+                text(run.message.clone()).size(13).color(MUTED).wrapping(Wrapping::None).width(Length::Fill),
+                if run.message.is_empty() {
+                    Element::from(space::horizontal().width(0))
+                } else {
+                    copy_button(app, CopyTarget::Message, false)
+                },
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
         ]
         .spacing(2)
         .width(Length::Fill),
@@ -618,8 +627,19 @@ fn log<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
     .style(ghost_button)
     .on_press(Message::ToggleLog);
 
+    let header = row![
+        toggle,
+        space::horizontal(),
+        if run.log.is_empty() {
+            Element::from(space::horizontal().width(0))
+        } else {
+            copy_button(app, CopyTarget::Output, true)
+        },
+    ]
+    .align_y(Alignment::Center);
+
     if !app.show_log {
-        return toggle.into();
+        return header.into();
     }
 
     let lines = run.log.iter().map(|line| {
@@ -633,7 +653,7 @@ fn log<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
     });
 
     column![
-        toggle,
+        header,
         container(scrollable(column(lines).spacing(2).padding(12).width(Length::Fill)).anchor_bottom().height(220))
             .width(Length::Fill)
             .style(theme::well),
@@ -643,6 +663,20 @@ fn log<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
 }
 
 // --------------------------------------------------------------- helpers --
+
+/// A ghost button that copies `target` and turns into a green "Copied" for a
+/// moment (driven by the `Fx` flash) as confirmation.
+fn copy_button<'a>(app: &App, target: CopyTarget, label: bool) -> Element<'a, Message> {
+    let confirmed = app.copied == Some(target) && app.fx.copy_flash() > 0.0;
+    let (icon, tint, caption) =
+        if confirmed { (lucide::check(), SUCCESS, "Copied") } else { (lucide::copy(), MUTED, "Copy") };
+
+    let mut content = row![icon.size(13).color(tint)].spacing(6).align_y(Alignment::Center);
+    if label || confirmed {
+        content = content.push(text(caption).size(13).color(tint));
+    }
+    button(content).padding([4, 8]).style(ghost_button).on_press(Message::Copy(target)).into()
+}
 
 fn centered_icon<'a>(icon: Text<'a>, size: f32, color: Color) -> Element<'a, Message> {
     icon.size(size).color(color).into()
