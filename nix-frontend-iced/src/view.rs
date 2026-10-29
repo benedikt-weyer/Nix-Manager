@@ -1,8 +1,10 @@
 //! Layout. Styling comes from `theme`, motion from `fx`.
 
 use chrono::{DateTime, Local, Utc};
+use iced::advanced::text::{highlighter, Highlighter};
 use iced::widget::{
-    button, column, container, mouse_area, row, scrollable, space, stack, text, text::Wrapping, text_input, Text,
+    button, column, container, mouse_area, row, scrollable, space, stack, text, text::Wrapping, text_editor,
+    text_input, Text,
 };
 use iced::{font, mouse, Alignment, Color, Element, Font, Length, Padding};
 use iced_fonts::lucide;
@@ -14,12 +16,8 @@ use crate::fx::{Fx, Slot, SLIDE};
 use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
 use crate::{store, Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
 
-/// The output view: fixed row height and viewport height let it draw only the
-/// rows that are visible.
-const LOG_ROW_HEIGHT: f32 = 18.0;
-const LOG_VIEW_HEIGHT: f32 = 220.0;
-/// Extra rows built above and below the viewport so scrolling never shows a gap.
-const LOG_OVERSCAN: usize = 4;
+/// How tall the output view is.
+const LOG_VIEW_HEIGHT: f32 = 260.0;
 
 pub(crate) const BOLD: Font = Font { weight: font::Weight::Semibold, ..Font::DEFAULT };
 
@@ -779,56 +777,80 @@ fn log<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
         return header.into();
     }
 
-    // Virtualised: every row is exactly `LOG_ROW_HEIGHT` tall, so which rows
-    // are on screen follows from the scroll position alone. Only those (plus
-    // a little overscan) are built and laid out; two spacers stand in for the
-    // rest so the scrollbar still reflects the whole log.
-    let total = run.log.len();
-    let (first, last) = visible_rows(total, app.log_from_bottom);
-
-    let mut rows = column![space::vertical().height(first as f32 * LOG_ROW_HEIGHT)];
-    for line in run.log.iter().skip(first).take(last.saturating_sub(first)) {
-        let color = if line.is_error { DANGER } else { TEXT };
-        rows = rows.push(
-            row![
-                text(phase_label(line.phase))
-                    .size(11)
-                    .font(Font::MONOSPACE)
-                    .color(theme::with_alpha(MUTED, 0.8))
-                    .width(66),
-                text(line.text.clone()).size(12).font(Font::MONOSPACE).color(color).wrapping(Wrapping::None),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center)
-            .height(LOG_ROW_HEIGHT),
-        );
-    }
-    rows = rows.push(space::vertical().height(total.saturating_sub(last) as f32 * LOG_ROW_HEIGHT));
+    // A read-only editor: it wraps long lines, and gives selection with the
+    // mouse and Ctrl+C for free. It only lays out what is on screen, so a long
+    // log stays cheap.
+    let editor = text_editor(&app.log_view)
+        .on_action(Message::LogAction)
+        .font(Font::MONOSPACE)
+        .size(12)
+        .padding(0)
+        .height(LOG_VIEW_HEIGHT)
+        .wrapping(Wrapping::WordOrGlyph)
+        .style(log_style)
+        .highlight_with::<LogHighlighter>((), |color, _| highlighter::Format { color: Some(*color), font: None });
 
     column![
         header,
-        container(
-            scrollable(rows.padding([0, 4]).width(Length::Fill))
-                .anchor_bottom()
-                .on_scroll(|viewport| Message::LogScrolled(viewport.absolute_offset().y))
-                .height(LOG_VIEW_HEIGHT),
-        )
-        .padding(8)
-        .width(Length::Fill)
-        .style(theme::well),
+        mouse_area(container(editor).padding(10).width(Length::Fill).style(theme::well))
+            .on_enter(Message::LogHover(true))
+            .on_exit(Message::LogHover(false)),
     ]
     .spacing(8)
     .into()
 }
 
-/// The range of log rows to build, given how many there are and how far the
-/// view is scrolled up from its bottom (px): the visible ones plus overscan.
-fn visible_rows(total: usize, from_bottom: f32) -> (usize, usize) {
-    let content_height = total as f32 * LOG_ROW_HEIGHT;
-    let top = (content_height - LOG_VIEW_HEIGHT - from_bottom).max(0.0);
-    let first = ((top / LOG_ROW_HEIGHT) as usize).saturating_sub(LOG_OVERSCAN).min(total);
-    let last = (((top + LOG_VIEW_HEIGHT) / LOG_ROW_HEIGHT).ceil() as usize + LOG_OVERSCAN).min(total);
-    (first, last)
+fn log_style(_: &iced::Theme, _: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: iced::Background::Color(Color::TRANSPARENT),
+        border: iced::Border::default(),
+        placeholder: MUTED,
+        value: TEXT,
+        selection: theme::with_alpha(ACCENT, 0.35),
+    }
+}
+
+/// Errors and warnings stand out in the output; nix has no markup for them
+/// once the colour codes are stripped, so they are recognised by their wording.
+fn line_color(line: &str) -> Option<Color> {
+    let line = line.trim_start().to_lowercase();
+    if line.starts_with("error") || line.contains(" failed") {
+        Some(DANGER)
+    } else if line.starts_with("warning") {
+        Some(WARNING)
+    } else {
+        None
+    }
+}
+
+struct LogHighlighter {
+    /// The first line that hasn't been coloured yet.
+    line: usize,
+}
+
+impl Highlighter for LogHighlighter {
+    type Settings = ();
+    type Highlight = Color;
+    type Iterator<'a> = std::option::IntoIter<(std::ops::Range<usize>, Color)>;
+
+    fn new(_: &()) -> Self {
+        Self { line: 0 }
+    }
+
+    fn update(&mut self, _: &()) {}
+
+    fn change_line(&mut self, line: usize) {
+        self.line = self.line.min(line);
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        self.line += 1;
+        line_color(line).map(|color| (0..line.len(), color)).into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.line
+    }
 }
 
 // --------------------------------------------------------------- helpers --
@@ -909,38 +931,12 @@ fn relative(then: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
 
-    /// Rows that fit the viewport.
-    const VISIBLE: usize = (LOG_VIEW_HEIGHT / LOG_ROW_HEIGHT) as usize + 1;
-
     #[test]
-    fn short_logs_are_drawn_whole() {
-        assert_eq!(visible_rows(0, 0.0), (0, 0));
-        assert_eq!(visible_rows(5, 0.0), (0, 5));
-    }
-
-    #[test]
-    fn following_the_bottom_draws_only_the_tail() {
-        let (first, last) = visible_rows(2000, 0.0);
-        assert_eq!(last, 2000);
-        assert!(first >= 2000 - VISIBLE - LOG_OVERSCAN - 1, "first = {first}");
-        assert!(last - first <= VISIBLE + 2 * LOG_OVERSCAN + 1);
-    }
-
-    #[test]
-    fn scrolled_to_the_top_draws_only_the_head() {
-        let from_bottom = 2000.0 * LOG_ROW_HEIGHT - LOG_VIEW_HEIGHT;
-        let (first, last) = visible_rows(2000, from_bottom);
-        assert_eq!(first, 0);
-        assert!((VISIBLE..=VISIBLE + LOG_OVERSCAN + 1).contains(&last), "last = {last}");
-    }
-
-    #[test]
-    fn mid_scroll_window_covers_the_viewport() {
-        // 100 rows scrolled so row 50 is at the top of the viewport.
-        let top_row = 50.0;
-        let from_bottom = 100.0 * LOG_ROW_HEIGHT - LOG_VIEW_HEIGHT - top_row * LOG_ROW_HEIGHT;
-        let (first, last) = visible_rows(100, from_bottom);
-        assert!(first <= 50 && last >= 50 + VISIBLE - 1, "({first}, {last})");
-        assert!(last - first <= VISIBLE + 2 * LOG_OVERSCAN + 1);
+    fn errors_and_warnings_are_coloured() {
+        assert_eq!(line_color("error: builder for 'x.drv' failed"), Some(DANGER));
+        assert_eq!(line_color("  Error: boom"), Some(DANGER));
+        assert_eq!(line_color("Build failed: nix build exited with 1"), Some(DANGER));
+        assert_eq!(line_color("warning: Git tree is dirty"), Some(WARNING));
+        assert_eq!(line_color("copying path '/nix/store/x' to the store"), None);
     }
 }

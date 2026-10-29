@@ -4,9 +4,11 @@ mod theme;
 mod view;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
+use iced::widget::text_editor;
 use iced::{window, Subscription, Task};
 use nix_backend_client::settings::Settings;
 use nix_backend_client::{
@@ -102,12 +104,6 @@ pub enum Outcome {
     Failed(String),
 }
 
-pub struct LogLine {
-    pub phase: EventPhase,
-    pub text: String,
-    pub is_error: bool,
-}
-
 /// The operation currently shown in the activity panel. It is built purely
 /// from the backend's `Watch` stream, so every frontend instance attached to
 /// the backend shows the same thing no matter which one started it.
@@ -121,7 +117,8 @@ pub struct Run {
     pub fraction: Option<f32>,
     pub stats: Option<BuildStats>,
     pub items: Vec<BuildItem>,
-    pub log: VecDeque<LogLine>,
+    /// The output, one entry per line. `App::log_view` is what is drawn.
+    pub log: VecDeque<String>,
 }
 
 impl Run {
@@ -179,9 +176,13 @@ pub struct App {
     /// Whether the downloads/builds list shows every running item instead of
     /// just the first few.
     pub show_all_items: bool,
-    /// How far the output view is scrolled up from its bottom, in px (0 =
-    /// following the newest line). The view only draws the rows around it.
-    pub log_from_bottom: f32,
+    /// The output as the (read-only) editor that draws it, which is what makes
+    /// the text wrap, selectable and copyable.
+    pub log_view: text_editor::Content,
+    /// Lines that arrived but aren't in `log_view` yet: it stands still while
+    /// the pointer is over it or text is selected, so reading isn't disturbed.
+    pub log_pending: Vec<String>,
+    pub log_hovered: bool,
     pub copied: Option<CopyTarget>,
     pub store: Store,
     pub fx: Fx,
@@ -209,7 +210,8 @@ pub enum Message {
     Hover(usize, bool),
     ToggleLog,
     ToggleItems,
-    LogScrolled(f32),
+    LogAction(text_editor::Action),
+    LogHover(bool),
     Copy(CopyTarget),
     DismissRun,
     DismissNotice,
@@ -289,7 +291,9 @@ impl App {
                 .unwrap_or_default(),
             show_log: true,
             show_all_items: false,
-            log_from_bottom: 0.0,
+            log_view: text_editor::Content::new(),
+            log_pending: Vec::new(),
+            log_hovered: false,
             copied: None,
             store: Store::new(),
             fx: Fx::new(),
@@ -528,16 +532,23 @@ impl App {
             }
             Message::ToggleLog => {
                 self.show_log = !self.show_log;
-                // A freshly shown scrollable starts at its bottom.
-                self.log_from_bottom = 0.0;
                 Task::none()
             }
             Message::ToggleItems => {
                 self.show_all_items = !self.show_all_items;
                 Task::none()
             }
-            Message::LogScrolled(from_bottom) => {
-                self.log_from_bottom = from_bottom;
+            Message::LogAction(action) => {
+                // Moving, selecting and scrolling are welcome; editing is not.
+                if !action.is_edit() {
+                    self.log_view.perform(action);
+                }
+                self.sync_log();
+                Task::none()
+            }
+            Message::LogHover(hovered) => {
+                self.log_hovered = hovered;
+                self.sync_log();
                 Task::none()
             }
             Message::Copy(target) => {
@@ -559,7 +570,7 @@ impl App {
                                 Outcome::Failed(message) => message.clone(),
                                 _ => run.message.clone(),
                             },
-                            _ => run.log.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n"),
+                            _ => run.log.iter().map(String::as_str).collect::<Vec<_>>().join("\n"),
                         }
                     }
                 };
@@ -573,6 +584,8 @@ impl App {
             Message::DismissRun => {
                 if !self.busy() {
                     self.run = None;
+                    self.log_view = text_editor::Content::new();
+                    self.log_pending.clear();
                 }
                 Task::none()
             }
@@ -805,6 +818,13 @@ impl App {
         }
     }
 
+    /// Brings the output view up to date, if the user isn't busy with it.
+    fn sync_log(&mut self) {
+        if let Some(run) = &self.run {
+            sync_log(&mut self.log_view, &mut self.log_pending, self.log_hovered, &run.log);
+        }
+    }
+
     fn load_destinations(&mut self) -> Task<Message> {
         let Some(mut client) = self.client() else {
             return Task::none();
@@ -868,7 +888,8 @@ impl App {
         // to us as a late joiner.
         if self.run.as_ref().is_none_or(|run| !run.running()) {
             self.run = Some(Run::new(kind, mode));
-            self.log_from_bottom = 0.0;
+            self.log_view = text_editor::Content::new();
+            self.log_pending.clear();
             self.fx.reset_progress();
             self.fx.restart(Slot::Activity, 0.0);
         }
@@ -879,13 +900,14 @@ impl App {
         let message = nix_backend_client::strip_ansi(&event.message);
         if !message.is_empty() {
             run.message = message.lines().next().unwrap_or_default().to_owned();
-            // One row per line: the output view relies on fixed-height rows.
             for line in message.lines() {
-                run.log.push_back(LogLine { phase, text: line.to_owned(), is_error: event.is_error });
+                run.log.push_back(line.to_owned());
+                self.log_pending.push(line.to_owned());
                 if run.log.len() > MAX_LOG_LINES {
                     run.log.pop_front();
                 }
             }
+            sync_log(&mut self.log_view, &mut self.log_pending, self.log_hovered, &run.log);
         }
         absorb_progress(run, &event, &mut self.fx);
 
@@ -927,6 +949,31 @@ impl App {
     }
 }
 
+/// Appends the lines in `pending` to the output view and follows them, unless
+/// the pointer is over the view or text is selected in it: new lines would move
+/// what is being read or selected, so they wait until the user is done.
+fn sync_log(view: &mut text_editor::Content, pending: &mut Vec<String>, hovered: bool, log: &VecDeque<String>) {
+    if pending.is_empty() || hovered || view.selection().is_some() {
+        return;
+    }
+    use text_editor::{Action, Edit, Motion};
+
+    // The view keeps growing past the log's own limit; start it afresh now and then.
+    if view.line_count() + pending.len() > MAX_LOG_LINES + 500 {
+        let lines: Vec<&str> = log.iter().map(String::as_str).collect();
+        *view = text_editor::Content::with_text(&lines.join("\n"));
+    } else {
+        let mut text = pending.join("\n");
+        if !view.is_empty() {
+            text.insert(0, '\n');
+        }
+        view.perform(Action::Move(Motion::DocumentEnd));
+        view.perform(Action::Edit(Edit::Paste(Arc::new(text))));
+    }
+    view.perform(Action::Move(Motion::DocumentEnd));
+    pending.clear();
+}
+
 /// Hands a web link to the desktop's default browser. Package metadata is not
 /// trusted to hold anything but web links.
 fn open_url(url: &str) {
@@ -955,5 +1002,64 @@ fn absorb_progress(run: &mut Run, event: &ProgressEvent, fx: &mut Fx) {
             run.fraction = Some(fraction);
             fx.set_progress(fraction);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(view: &text_editor::Content) -> Vec<String> {
+        view.lines().map(|line| line.text.to_string()).collect()
+    }
+
+    #[test]
+    fn output_lines_follow_in_order() {
+        let mut view = text_editor::Content::new();
+        let mut pending = vec!["one".to_owned(), "two".to_owned()];
+        let log = VecDeque::new();
+
+        sync_log(&mut view, &mut pending, false, &log);
+        assert_eq!(lines(&view), ["one", "two"]);
+        assert!(pending.is_empty());
+
+        pending.push("three".to_owned());
+        sync_log(&mut view, &mut pending, false, &log);
+        assert_eq!(lines(&view), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn output_waits_while_the_pointer_is_over_it() {
+        let mut view = text_editor::Content::with_text("one");
+        let mut pending = vec!["two".to_owned()];
+
+        sync_log(&mut view, &mut pending, true, &VecDeque::new());
+        assert_eq!(lines(&view), ["one"]);
+        assert_eq!(pending, ["two"]);
+
+        sync_log(&mut view, &mut pending, false, &VecDeque::new());
+        assert_eq!(lines(&view), ["one", "two"]);
+    }
+
+    #[test]
+    fn output_waits_while_text_is_selected() {
+        let mut view = text_editor::Content::with_text("one");
+        view.perform(text_editor::Action::SelectAll);
+        let mut pending = vec!["two".to_owned()];
+
+        sync_log(&mut view, &mut pending, false, &VecDeque::new());
+        assert_eq!(view.selection().as_deref(), Some("one"), "the selection must survive");
+        assert_eq!(pending, ["two"]);
+    }
+
+    #[test]
+    fn a_runaway_view_is_rebuilt_from_the_log() {
+        let log: VecDeque<String> = (0..MAX_LOG_LINES).map(|i| format!("line {i}")).collect();
+        let mut view = text_editor::Content::with_text(&vec!["old"; MAX_LOG_LINES + 400].join("\n"));
+        let mut pending = vec!["x".to_owned(); 200];
+
+        sync_log(&mut view, &mut pending, false, &log);
+        assert_eq!(view.line_count(), MAX_LOG_LINES);
+        assert!(pending.is_empty());
     }
 }
