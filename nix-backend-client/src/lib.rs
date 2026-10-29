@@ -21,12 +21,15 @@ pub mod proto {
 }
 
 pub use proto::{
-    BuildItem, BuildItemKind, BuildItemStatus, BuildStats, EventPhase, FlakeStatusReply, OperationEvent, OperationKind,
-    ProgressEvent, RebuildMode, SystemTarget,
+    BuildItem, BuildItemKind, BuildItemStatus, BuildStats, EventPhase, FlakeStatusReply, Maintainer, OperationEvent,
+    OperationKind, Package, PackageSummary, ProgressEvent, RebuildMode, SearchPackagesReply, SystemTarget,
 };
 
 use proto::nix_backend_client::NixBackendClient;
-use proto::{FlakeStatusRequest, RebuildRequest, UpdateFlakeRequest, WatchRequest};
+use proto::{
+    FlakeStatusRequest, GetPackageRequest, ListInstalledRequest, RebuildRequest, SearchPackagesRequest,
+    UpdateFlakeRequest, WatchRequest,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
@@ -80,6 +83,31 @@ impl Client {
     pub async fn flake_status(&mut self, target: SystemTarget) -> Result<FlakeStatusReply, Status> {
         let reply = self.inner.get_flake_status(FlakeStatusRequest { target: Some(target) }).await?;
         Ok(reply.into_inner())
+    }
+
+    /// Searches the nixpkgs the target's flake has locked. `limit` of 0 means
+    /// the backend's default. The first search against a new nixpkgs revision
+    /// can take a while.
+    pub async fn search_packages(
+        &mut self,
+        target: SystemTarget,
+        query: String,
+        limit: u32,
+    ) -> Result<SearchPackagesReply, Status> {
+        let request = SearchPackagesRequest { target: Some(target), query, limit };
+        Ok(self.inner.search_packages(request).await?.into_inner())
+    }
+
+    /// Everything known about one package, by its nixpkgs attribute.
+    pub async fn get_package(&mut self, target: SystemTarget, attr: String) -> Result<Package, Status> {
+        let request = GetPackageRequest { target: Some(target), attr };
+        Ok(self.inner.get_package(request).await?.into_inner())
+    }
+
+    /// The packages the target's NixOS configuration installs.
+    pub async fn list_installed_packages(&mut self, target: SystemTarget) -> Result<Vec<Package>, Status> {
+        let reply = self.inner.list_installed_packages(ListInstalledRequest { target: Some(target) }).await?;
+        Ok(reply.into_inner().packages)
     }
 
     /// Every event of every operation, whoever started it. Frontends should

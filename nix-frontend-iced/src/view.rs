@@ -12,7 +12,7 @@ use nix_backend_client::{
 
 use crate::fx::{Fx, Slot, SLIDE};
 use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
-use crate::{Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
+use crate::{store, Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
 
 /// The output view: fixed row height and viewport height let it draw only the
 /// rows that are visible.
@@ -21,7 +21,7 @@ const LOG_VIEW_HEIGHT: f32 = 220.0;
 /// Extra rows built above and below the viewport so scrolling never shows a gap.
 const LOG_OVERSCAN: usize = 4;
 
-const BOLD: Font = Font { weight: font::Weight::Semibold, ..Font::DEFAULT };
+pub(crate) const BOLD: Font = Font { weight: font::Weight::Semibold, ..Font::DEFAULT };
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let fx = &app.fx;
@@ -45,6 +45,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 sections = sections.push(notice_banner(notice));
             }
             sections = sections.push(reveal(fx, Slot::Overview, settings(app)));
+        }
+        Page::Store => {
+            sections = sections.push(reveal(fx, Slot::Overview, store::page(app)));
         }
     }
 
@@ -90,8 +93,9 @@ fn header(app: &App) -> Element<'_, Message> {
         space::horizontal(),
         connection_pill(app),
         match app.page {
-            Page::Dashboard => Element::from(row![refresh_button(app), settings_button()].spacing(4)),
-            Page::Settings => back_button(),
+            Page::Dashboard => Element::from(row![refresh_button(app), store_button(), settings_button()].spacing(4)),
+            Page::Settings => back_button(Message::CloseSettings),
+            Page::Store => back_button(Message::StoreBack),
         },
     ]
     .spacing(14)
@@ -141,11 +145,19 @@ fn settings_button<'a>() -> Element<'a, Message> {
         .into()
 }
 
-fn back_button<'a>() -> Element<'a, Message> {
+fn store_button<'a>() -> Element<'a, Message> {
+    button(centered_icon(lucide::store(), 16.0, MUTED))
+        .padding(10)
+        .style(ghost_button)
+        .on_press(Message::OpenStore)
+        .into()
+}
+
+fn back_button<'a>(message: Message) -> Element<'a, Message> {
     button(row![lucide::arrow_left().size(14), text("Back").size(13)].spacing(8).align_y(Alignment::Center))
         .padding([8, 14])
         .style(ghost_button)
-        .on_press(Message::CloseSettings)
+        .on_press(message)
         .into()
 }
 
@@ -158,7 +170,7 @@ fn refresh_button(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-fn ghost_button(_: &iced::Theme, status: button::Status) -> button::Style {
+pub(crate) fn ghost_button(_: &iced::Theme, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
         background: Some(iced::Background::Color(if hovered { theme::RAISED } else { Color::TRANSPARENT })),
@@ -570,7 +582,13 @@ fn step_icon(phase: EventPhase) -> Text<'static> {
 
 /// A bar of the given `height` filled to `value` (0..1), or, when nothing is
 /// measurable yet (`None`), with a highlight sweeping across it.
-fn bar<'a>(value: Option<f32>, fx: &Fx, tint: Color, track_color: Color, height: f32) -> Element<'a, Message> {
+pub(crate) fn bar<'a>(
+    value: Option<f32>,
+    fx: &Fx,
+    tint: Color,
+    track_color: Color,
+    height: f32,
+) -> Element<'a, Message> {
     const SCALE: f32 = 1000.0;
     let portion = |v: f32| Length::FillPortion((v * SCALE).round().max(1.0) as u16);
     let radius = height / 2.0;
@@ -816,7 +834,7 @@ fn visible_rows(total: usize, from_bottom: f32) -> (usize, usize) {
 
 /// A ghost button that copies `target` and turns into a green "Copied" for a
 /// moment (driven by the `Fx` flash) as confirmation.
-fn copy_button<'a>(app: &App, target: CopyTarget, label: bool) -> Element<'a, Message> {
+pub(crate) fn copy_button<'a>(app: &App, target: CopyTarget, label: bool) -> Element<'a, Message> {
     let confirmed = app.copied == Some(target) && app.fx.copy_flash() > 0.0;
     let (icon, tint, caption) =
         if confirmed { (lucide::check(), SUCCESS, "Copied") } else { (lucide::copy(), MUTED, "Copy") };
@@ -828,12 +846,18 @@ fn copy_button<'a>(app: &App, target: CopyTarget, label: bool) -> Element<'a, Me
     button(content).padding([4, 8]).style(ghost_button).on_press(Message::Copy(target)).into()
 }
 
-fn centered_icon<'a>(icon: Text<'a>, size: f32, color: Color) -> Element<'a, Message> {
+pub(crate) fn centered_icon<'a>(icon: Text<'a>, size: f32, color: Color) -> Element<'a, Message> {
     icon.size(size).color(color).into()
 }
 
 /// An icon on a softly tinted rounded square.
-fn icon_tile<'a>(icon: Text<'a>, tint: Color, icon_size: f32, side: f32, strength: f32) -> Element<'a, Message> {
+pub(crate) fn icon_tile<'a>(
+    icon: Text<'a>,
+    tint: Color,
+    icon_size: f32,
+    side: f32,
+    strength: f32,
+) -> Element<'a, Message> {
     container(icon.size(icon_size).color(tint))
         .width(side)
         .height(side)

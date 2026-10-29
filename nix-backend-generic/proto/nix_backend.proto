@@ -28,6 +28,19 @@ service NixBackend {
     // that is already running, then everything after it. Never ends on its
     // own.
     rpc Watch(WatchRequest) returns (stream OperationEvent);
+
+    // Searches the nixpkgs the target flake has locked (so results match what
+    // a rebuild would install, not whatever the registry points at today).
+    // The first search against a new nixpkgs revision evaluates all of it and
+    // can take a while; later ones are served from nix's evaluation cache.
+    rpc SearchPackages(SearchPackagesRequest) returns (SearchPackagesReply);
+
+    // Full details of one package from that same nixpkgs.
+    rpc GetPackage(GetPackageRequest) returns (Package);
+
+    // The packages the target's NixOS configuration installs: system
+    // packages, per-user packages and (when used) home-manager packages.
+    rpc ListInstalledPackages(ListInstalledRequest) returns (ListInstalledReply);
 }
 
 // Only one UpdateFlake/Rebuild runs at a time per backend. Starting another
@@ -165,4 +178,73 @@ message OperationEvent {
     // Only meaningful when kind is REBUILD.
     RebuildMode mode = 2;
     ProgressEvent event = 3;
+}
+
+message SearchPackagesRequest {
+    SystemTarget target = 1;
+    // Whitespace separated words, all of which must match the package's name,
+    // attribute or description. Matched literally, not as a regex.
+    string query = 2;
+    // Maximum number of packages returned; 0 means the backend's default.
+    uint32 limit = 3;
+}
+
+// What a search result shows; `GetPackage` has the rest.
+message PackageSummary {
+    // Attribute path inside nixpkgs, e.g. "hello" or "kdePackages.kate".
+    string attr = 1;
+    string pname = 2;
+    string version = 3;
+    string description = 4;
+}
+
+message SearchPackagesReply {
+    // Best matches first.
+    repeated PackageSummary packages = 1;
+    // How many packages matched in total, before the limit was applied.
+    uint32 total_matches = 2;
+    // Which nixpkgs was searched, for display, e.g. "nixpkgs @ 31ecbac".
+    string source = 3;
+}
+
+message GetPackageRequest {
+    SystemTarget target = 1;
+    string attr = 2;
+}
+
+message Maintainer {
+    string name = 1;
+    // GitHub user name, empty if the maintainer has none.
+    string github = 2;
+}
+
+message Package {
+    // Empty for installed packages, where nixpkgs' attribute isn't known.
+    string attr = 1;
+    // "hello-2.12.3"
+    string name = 2;
+    string pname = 3;
+    string version = 4;
+    string description = 5;
+    string long_description = 6;
+    string homepage = 7;
+    repeated string licenses = 8;
+    repeated Maintainer maintainers = 9;
+    string main_program = 10;
+    // Where the package is defined, relative to the nixpkgs root, e.g.
+    // "pkgs/by-name/he/hello/package.nix". Empty when unknown.
+    string source_path = 11;
+    uint32 source_line = 12;
+    // The definition on GitHub, pinned to the locked nixpkgs revision.
+    // Empty when the package doesn't come from nixpkgs.
+    string source_url = 13;
+}
+
+message ListInstalledRequest {
+    SystemTarget target = 1;
+}
+
+message ListInstalledReply {
+    // Sorted by name, without duplicates.
+    repeated Package packages = 1;
 }

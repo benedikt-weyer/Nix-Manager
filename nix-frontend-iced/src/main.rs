@@ -1,4 +1,5 @@
 mod fx;
+mod store;
 mod theme;
 mod view;
 
@@ -9,11 +10,12 @@ use futures::StreamExt;
 use iced::{window, Subscription, Task};
 use nix_backend_client::settings::Settings;
 use nix_backend_client::{
-    BuildItem, BuildStats, Client, EventPhase, FlakeStatusReply, OperationEvent, OperationKind, ProgressEvent,
-    RebuildMode, SystemTarget,
+    BuildItem, BuildStats, Client, EventPhase, FlakeStatusReply, OperationEvent, OperationKind, Package, ProgressEvent,
+    RebuildMode, SearchPackagesReply, SystemTarget,
 };
 
 use fx::{Fx, Slot};
+use store::{Detail, Load, Store, Tab};
 
 const ICON_PNG: &[u8] = include_bytes!("../../assets/icons/nix-manager-256.png");
 
@@ -75,12 +77,15 @@ pub enum CopyTarget {
     Message,
     /// The whole output log.
     Output,
+    /// Where the open package is defined in nixpkgs.
+    SourcePath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Page {
     Dashboard,
     Settings,
+    Store,
 }
 
 pub enum Conn {
@@ -176,6 +181,7 @@ pub struct App {
     /// following the newest line). The view only draws the rows around it.
     pub log_from_bottom: f32,
     pub copied: Option<CopyTarget>,
+    pub store: Store,
     pub fx: Fx,
     last_frame: Option<Instant>,
 }
@@ -205,6 +211,19 @@ pub enum Message {
     Copy(CopyTarget),
     DismissRun,
     DismissNotice,
+    OpenStore,
+    StoreBack,
+    StoreTab(Tab),
+    StoreQuery(String),
+    StoreSearch,
+    StoreSearched(u64, Result<SearchPackagesReply, String>),
+    StoreFilter(String),
+    InstalledLoaded(SystemTarget, Result<Vec<Package>, String>),
+    ReloadInstalled,
+    OpenResult(usize),
+    OpenInstalled(usize),
+    PackageLoaded(String, Result<Package, String>),
+    OpenUrl(String),
 }
 
 fn status_text(status: nix_backend_client::Status) -> String {
@@ -257,6 +276,7 @@ impl App {
             show_all_items: false,
             log_from_bottom: 0.0,
             copied: None,
+            store: Store::new(),
             fx: Fx::new(),
             last_frame: None,
         };
@@ -344,7 +364,7 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
-        self.fx.set_looping(self.busy() || matches!(self.conn, Conn::Connecting));
+        self.fx.set_looping(self.busy() || self.store.busy() || matches!(self.conn, Conn::Connecting));
         if !self.fx.animating() {
             // Frames stop arriving once nothing moves; don't let the gap count
             // as one huge step when they resume.
@@ -370,7 +390,8 @@ impl App {
             }
             Message::Connected(Ok(client)) => {
                 self.conn = Conn::Online(client.clone());
-                Task::batch([self.load_status(), watch(client)])
+                let installed = if self.page == Page::Store { self.load_installed() } else { Task::none() };
+                Task::batch([self.load_status(), watch(client), installed])
             }
             Message::Connected(Err(error)) => {
                 self.go_offline(error);
@@ -452,6 +473,7 @@ impl App {
                 self.persist();
                 // Forget what we knew about the old target.
                 self.status = None;
+                self.store.reset();
                 self.load_status()
             }
             Message::Start(action) => {
@@ -500,13 +522,24 @@ impl App {
                 Task::none()
             }
             Message::Copy(target) => {
-                let Some(run) = &self.run else { return Task::none() };
                 let text = match target {
-                    CopyTarget::Message => match &run.outcome {
-                        Outcome::Failed(message) => message.clone(),
-                        _ => run.message.clone(),
-                    },
-                    CopyTarget::Output => run.log.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n"),
+                    CopyTarget::SourcePath => self
+                        .store
+                        .detail
+                        .as_ref()
+                        .and_then(|detail| detail.package.ready())
+                        .map(|package| package.source_path.clone())
+                        .unwrap_or_default(),
+                    CopyTarget::Message | CopyTarget::Output => {
+                        let Some(run) = &self.run else { return Task::none() };
+                        match target {
+                            CopyTarget::Message => match &run.outcome {
+                                Outcome::Failed(message) => message.clone(),
+                                _ => run.message.clone(),
+                            },
+                            _ => run.log.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n"),
+                        }
+                    }
                 };
                 if text.is_empty() {
                     return Task::none();
@@ -525,7 +558,115 @@ impl App {
                 self.notice = None;
                 Task::none()
             }
+            Message::OpenStore => {
+                self.show(Page::Store);
+                let installed =
+                    if matches!(self.store.installed, Load::Idle) { self.load_installed() } else { Task::none() };
+                Task::batch([installed, iced::widget::operation::focus(store::SEARCH_ID)])
+            }
+            Message::StoreBack => {
+                if self.store.detail.take().is_none() {
+                    self.show(Page::Dashboard);
+                }
+                Task::none()
+            }
+            Message::StoreTab(tab) => {
+                self.store.tab = tab;
+                iced::widget::operation::focus(store::SEARCH_ID)
+            }
+            Message::StoreQuery(query) => {
+                self.store.query = query;
+                Task::none()
+            }
+            Message::StoreFilter(filter) => {
+                self.store.filter = filter;
+                Task::none()
+            }
+            Message::StoreSearch => {
+                let query = self.store.query.trim().to_owned();
+                let Some(mut client) = self.client().filter(|_| !query.is_empty()) else {
+                    return Task::none();
+                };
+                self.store.search_seq += 1;
+                let seq = self.store.search_seq;
+                self.store.results = Load::Loading;
+                self.store.searched = query.clone();
+                let target = self.target();
+                Task::perform(
+                    async move { client.search_packages(target, query, 0).await.map_err(status_text) },
+                    move |result| Message::StoreSearched(seq, result),
+                )
+            }
+            Message::StoreSearched(seq, result) => {
+                // Only the latest search counts.
+                if seq == self.store.search_seq {
+                    self.store.results = Load::from_result(result);
+                }
+                Task::none()
+            }
+            Message::ReloadInstalled => self.load_installed(),
+            Message::InstalledLoaded(requested, result) => {
+                // The target may have changed while the configuration was being read.
+                if requested == self.target() {
+                    self.store.set_installed(result);
+                }
+                Task::none()
+            }
+            Message::OpenResult(index) => {
+                let Some(summary) = self.store.results.ready().and_then(|reply| reply.packages.get(index)) else {
+                    return Task::none();
+                };
+                let attr = summary.attr.clone();
+                let title = if summary.pname.is_empty() { attr.clone() } else { summary.pname.clone() };
+                let Some(mut client) = self.client() else {
+                    return Task::none();
+                };
+                self.store.detail = Some(Detail { title, attr: attr.clone(), package: Load::Loading });
+                let target = self.target();
+                Task::perform(
+                    async move {
+                        let result = client.get_package(target, attr.clone()).await.map_err(status_text);
+                        (attr, result)
+                    },
+                    |(attr, result)| Message::PackageLoaded(attr, result),
+                )
+            }
+            Message::OpenInstalled(index) => {
+                if let Some(package) = self.store.installed.ready().and_then(|packages| packages.get(index)) {
+                    self.store.detail = Some(Detail {
+                        title: package.name.clone(),
+                        attr: String::new(),
+                        package: Load::Ready(package.clone()),
+                    });
+                }
+                Task::none()
+            }
+            Message::PackageLoaded(attr, result) => {
+                if let Some(detail) = self.store.detail.as_mut().filter(|detail| detail.attr == attr) {
+                    detail.package = Load::from_result(result);
+                }
+                Task::none()
+            }
+            Message::OpenUrl(url) => {
+                open_url(&url);
+                Task::none()
+            }
         }
+    }
+
+    fn load_installed(&mut self) -> Task<Message> {
+        let Some(mut client) = self.client() else {
+            return Task::none();
+        };
+        self.store.installed = Load::Loading;
+        let target = self.target();
+        Task::perform(
+            async move {
+                let result = client.list_installed_packages(target.clone()).await.map_err(status_text);
+                (target, result)
+            },
+            |(target, result)| Message::InstalledLoaded(target, result),
+        )
     }
 
     /// Folds one backend event into the activity panel.
@@ -568,8 +709,11 @@ impl App {
                 run.items.clear();
                 run.fraction = Some(1.0);
                 self.fx.set_progress(1.0);
-                // A finished update or rebuild changes what the status card shows.
-                return self.load_status();
+                // A finished update or rebuild changes what the status card shows,
+                // and what the configuration installs.
+                self.store.installed = Load::Idle;
+                let installed = if self.page == Page::Store { self.load_installed() } else { Task::none() };
+                return Task::batch([self.load_status(), installed]);
             }
             EventPhase::Failed => {
                 run.outcome = Outcome::Failed(message);
@@ -594,6 +738,20 @@ impl App {
             subscriptions.push(iced::time::every(Duration::from_secs(2)).map(|_| Message::Retry));
         }
         Subscription::batch(subscriptions)
+    }
+}
+
+/// Hands a web link to the desktop's default browser. Package metadata is not
+/// trusted to hold anything but web links.
+fn open_url(url: &str) {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return;
+    }
+    if let Ok(mut child) = std::process::Command::new("xdg-open").arg(url).spawn() {
+        // Reaped off-thread so it doesn't linger as a zombie.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
     }
 }
 

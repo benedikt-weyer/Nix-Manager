@@ -1,6 +1,7 @@
 mod activity;
 mod config;
 mod nix_ops;
+mod store;
 
 pub mod proto {
     tonic::include_proto!("caelestia.nixbackend.v1");
@@ -19,7 +20,8 @@ use tonic::{Request, Response, Status};
 
 use proto::nix_backend_server::{NixBackend, NixBackendServer};
 use proto::{
-    FlakeStatusReply, FlakeStatusRequest, OperationEvent, OperationKind, ProgressEvent, RebuildMode, RebuildRequest,
+    FlakeStatusReply, FlakeStatusRequest, GetPackageRequest, ListInstalledReply, ListInstalledRequest, OperationEvent,
+    OperationKind, Package, ProgressEvent, RebuildMode, RebuildRequest, SearchPackagesReply, SearchPackagesRequest,
     UpdateFlakeRequest, WatchRequest,
 };
 
@@ -144,6 +146,29 @@ impl NixBackend for Service {
     async fn get_flake_status(&self, request: Request<FlakeStatusRequest>) -> Result<Response<FlakeStatusReply>, Status> {
         let target = config::resolve(request.into_inner().target.as_ref());
         Ok(Response::new(nix_ops::flake_status(&target).await))
+    }
+
+    async fn search_packages(
+        &self,
+        request: Request<SearchPackagesRequest>,
+    ) -> Result<Response<SearchPackagesReply>, Status> {
+        let req = request.into_inner();
+        let target = config::resolve(req.target.as_ref());
+        Ok(Response::new(store::search(&target, &req.query, req.limit).await?))
+    }
+
+    async fn get_package(&self, request: Request<GetPackageRequest>) -> Result<Response<Package>, Status> {
+        let req = request.into_inner();
+        let target = config::resolve(req.target.as_ref());
+        Ok(Response::new(store::package(&target, &req.attr).await?))
+    }
+
+    async fn list_installed_packages(
+        &self,
+        request: Request<ListInstalledRequest>,
+    ) -> Result<Response<ListInstalledReply>, Status> {
+        let target = config::resolve(request.into_inner().target.as_ref());
+        Ok(Response::new(store::installed(&target).await?))
     }
 }
 
