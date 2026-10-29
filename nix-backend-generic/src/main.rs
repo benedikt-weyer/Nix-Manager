@@ -8,48 +8,133 @@ pub mod proto {
 
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use futures::Stream;
 use tokio::net::UnixListener;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, UnixListenerStream};
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
 use proto::nix_backend_server::{NixBackend, NixBackendServer};
-use proto::{FlakeStatusReply, FlakeStatusRequest, ProgressEvent, RebuildMode, RebuildRequest, UpdateFlakeRequest};
+use proto::{
+    FlakeStatusReply, FlakeStatusRequest, OperationEvent, OperationKind, ProgressEvent, RebuildMode, RebuildRequest,
+    UpdateFlakeRequest, WatchRequest,
+};
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<ProgressEvent, Status>> + Send>>;
+type OperationStream = Pin<Box<dyn Stream<Item = Result<OperationEvent, Status>> + Send>>;
 
-#[derive(Default)]
-struct Service;
+/// Shared by every connection, so any number of frontends can be attached to
+/// one backend: it enforces one running operation at a time and fans the
+/// running operation's events out to every `Watch` subscriber.
+struct Hub {
+    running: Mutex<Option<OperationEvent>>,
+    events: broadcast::Sender<OperationEvent>,
+}
+
+impl Hub {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { running: Mutex::new(None), events: broadcast::channel(256).0 })
+    }
+
+    /// Claims the single operation slot.
+    fn begin(&self, kind: OperationKind, mode: RebuildMode) -> Result<(), Status> {
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        if running.is_some() {
+            return Err(Status::failed_precondition("another operation is already running"));
+        }
+        *running = Some(OperationEvent { kind: kind as i32, mode: mode as i32, event: None });
+        Ok(())
+    }
+
+    fn publish(&self, kind: OperationKind, mode: RebuildMode, event: &ProgressEvent) {
+        let tagged = OperationEvent { kind: kind as i32, mode: mode as i32, event: Some(event.clone()) };
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(tagged.clone());
+        // No subscribers is fine.
+        let _ = self.events.send(tagged);
+    }
+
+    fn end(&self) {
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Subscribes first, then snapshots, so no event can fall in the gap.
+    fn subscribe(&self) -> (broadcast::Receiver<OperationEvent>, Option<OperationEvent>) {
+        let rx = self.events.subscribe();
+        let snapshot = self.running.lock().unwrap_or_else(|e| e.into_inner()).clone().filter(|op| op.event.is_some());
+        (rx, snapshot)
+    }
+}
+
+/// Forwards an operation's events to the client that started it and to the
+/// hub. The starter disconnecting must not abort the operation (a rebuild
+/// half-way through activation is worse than one nobody is watching), so
+/// send failures to it are ignored and the operation is always drained.
+async fn pump(
+    hub: Arc<Hub>,
+    kind: OperationKind,
+    mode: RebuildMode,
+    mut rx: mpsc::Receiver<Result<ProgressEvent, Status>>,
+    out: mpsc::Sender<Result<ProgressEvent, Status>>,
+) {
+    while let Some(item) = rx.recv().await {
+        if let Ok(event) = &item {
+            hub.publish(kind, mode, event);
+        }
+        let _ = out.send(item).await;
+    }
+    hub.end();
+}
+
+struct Service {
+    hub: Arc<Hub>,
+}
 
 #[tonic::async_trait]
 impl NixBackend for Service {
     type UpdateFlakeStream = EventStream;
     type RebuildStream = EventStream;
+    type WatchStream = OperationStream;
 
     async fn update_flake(&self, request: Request<UpdateFlakeRequest>) -> Result<Response<Self::UpdateFlakeStream>, Status> {
         let target = config::resolve(request.into_inner().target.as_ref());
+        self.hub.begin(OperationKind::UpdateFlake, RebuildMode::Unspecified)?;
         let (tx, rx) = mpsc::channel(64);
+        let (out_tx, out_rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
             nix_ops::update_flake(&target, tx).await;
         });
+        tokio::spawn(pump(self.hub.clone(), OperationKind::UpdateFlake, RebuildMode::Unspecified, rx, out_tx));
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
     }
 
     async fn rebuild(&self, request: Request<RebuildRequest>) -> Result<Response<Self::RebuildStream>, Status> {
         let req = request.into_inner();
         let target = config::resolve(req.target.as_ref());
         let mode = RebuildMode::try_from(req.mode).unwrap_or(RebuildMode::Switch);
+        self.hub.begin(OperationKind::Rebuild, mode)?;
         let (tx, rx) = mpsc::channel(64);
+        let (out_tx, out_rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
             nix_ops::rebuild(&target, mode, tx).await;
         });
+        tokio::spawn(pump(self.hub.clone(), OperationKind::Rebuild, mode, rx, out_tx));
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+    }
+
+    async fn watch(&self, _request: Request<WatchRequest>) -> Result<Response<Self::WatchStream>, Status> {
+        let (rx, snapshot) = self.hub.subscribe();
+        // A subscriber that falls too far behind just skips the missed events;
+        // the next one carries a full snapshot of what's active anyway.
+        let live = BroadcastStream::new(rx).filter_map(|item| item.ok().map(Ok));
+        let stream = tokio_stream::iter(snapshot.into_iter().map(Ok)).chain(live);
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn get_flake_status(&self, request: Request<FlakeStatusRequest>) -> Result<Response<FlakeStatusReply>, Status> {
@@ -112,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("nix-backend-generic listening on {socket_path}");
 
     tonic::transport::Server::builder()
-        .add_service(NixBackendServer::new(Service))
+        .add_service(NixBackendServer::new(Service { hub: Hub::new() }))
         .serve_with_incoming(UnixListenerStream::new(listener))
         .await?;
 

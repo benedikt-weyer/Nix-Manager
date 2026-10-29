@@ -19,7 +19,17 @@ service NixBackend {
 
     // Reports when the flake was last changed, from git history.
     rpc GetFlakeStatus(FlakeStatusRequest) returns (FlakeStatusReply);
+
+    // Streams every event of every operation, no matter which client started
+    // it. This is how several frontends attached to the same backend stay in
+    // sync: a late subscriber first receives the latest event of an operation
+    // that is already running, then everything after it. Never ends on its
+    // own.
+    rpc Watch(WatchRequest) returns (stream OperationEvent);
 }
+
+// Only one UpdateFlake/Rebuild runs at a time per backend. Starting another
+// while one is in flight fails with FAILED_PRECONDITION.
 
 // Identifies which flake/host to operate on. Either field left empty falls
 // back to the daemon's own resolution (NIX_BACKEND_CONFIG_DIR /
@@ -126,4 +136,21 @@ message ProgressEvent {
     // Current snapshot of in-flight/recently-finished builds and downloads.
     repeated BuildItem active_items = 5;
     BuildStats stats = 6;
+}
+
+message WatchRequest {}
+
+enum OperationKind {
+    OPERATION_KIND_UNSPECIFIED = 0;
+    UPDATE_FLAKE = 1;
+    REBUILD = 2;
+}
+
+// A ProgressEvent tagged with the operation it belongs to, so a client that
+// didn't start the operation can still tell what is running.
+message OperationEvent {
+    OperationKind kind = 1;
+    // Only meaningful when kind is REBUILD.
+    RebuildMode mode = 2;
+    ProgressEvent event = 3;
 }

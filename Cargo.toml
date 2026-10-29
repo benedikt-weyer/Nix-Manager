@@ -1,0 +1,10 @@
+# Workspace for everything that talks to the backend: the shared client crate
+# and the frontends. The backend is deliberately not a member - it stays a
+# standalone crate with its own lockfile so it can be packaged on its own.
+#
+# One backend serves any number of frontend instances at once (see the Watch
+# RPC in the backend's proto).
+[workspace]
+resolver = "2"
+members = ["nix-backend-client", "nix-frontend-iced"]
+exclude = ["nix-backend-generic"]

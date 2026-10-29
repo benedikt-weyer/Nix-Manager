@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Lists the dev commands.
+cat <<'TEXT'
+Nix-Manager dev commands
+
+Environment
+  direnv allow                 enter the dev shell automatically (.envrc -> use flake)
+  nix develop                  or enter it by hand
+
+Run
+  ./scripts/run                        build, start the backend and one frontend window
+  ./scripts/run -n 3                   ...three frontend windows on the same backend
+  ./scripts/run -b                     backend only, in the foreground
+  ./scripts/run -f                     only a frontend window, attached to a running dev backend
+  ./scripts/run -r                     release build
+  ./scripts/run -c DIR -H HOST         point the backend at a flake directory / nixosConfiguration
+
+  The backend uses its own socket ($XDG_RUNTIME_DIR/nix-manager-dev.sock), so it never
+  takes over a real daemon's socket. The default target is /etc/nixos: rebuilds and
+  updates are real, so use -c with a scratch flake while developing.
+
+Build, check, test
+  cargo build --workspace                                         client + frontends
+  cargo build --manifest-path nix-backend-generic/Cargo.toml      backend (standalone crate)
+  cargo clippy --workspace --all-targets
+  cargo test --workspace
+  cargo fmt --all                                                 client + frontends only
+  cargo watch -x 'clippy --workspace --all-targets'               re-check on save
+  cargo clean                                                     (and again with --manifest-path ...)
+
+Talk to the backend directly
+  S=$XDG_RUNTIME_DIR/nix-manager-dev.sock
+  P="-import-path nix-backend-generic/proto -proto nix_backend.proto"
+  grpcurl -plaintext -unix $P $S list caelestia.nixbackend.v1.NixBackend
+  grpcurl -plaintext -unix $P -d '{}' $S caelestia.nixbackend.v1.NixBackend/GetFlakeStatus
+  grpcurl -plaintext -unix $P -d '{}' $S caelestia.nixbackend.v1.NixBackend/Watch
+
+Layout
+  nix-backend-generic/    gRPC backend (standalone crate; owns proto/nix_backend.proto)
+  nix-backend-client/     frontend-agnostic client library shared by every frontend
+  nix-frontend-iced/      iced + mina GUI frontend
+
+One backend serves any number of frontend instances at once: they all follow the same
+operation through the backend's Watch stream, and only one update/rebuild runs at a time.
+
+Environment variables
+  NIX_BACKEND_SOCKET        socket to use
+  NIX_BACKEND_CONFIG_DIR    flake directory (default /etc/nixos)
+  NIX_BACKEND_HOST_NAME     host to build (default: this machine's hostname)
+  RUST_LOG                  backend log filter (default info)
+TEXT

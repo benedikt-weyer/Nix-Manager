@@ -1,0 +1,19 @@
+[package]
+name = "nix-frontend-iced"
+version = "0.1.0"
+edition = "2021"
+description = "iced frontend for the Nix-Manager backend"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "nix-frontend-iced"
+path = "src/main.rs"
+
+[dependencies]
+nix-backend-client = { path = "../nix-backend-client" }
+iced = { version = "0.14", features = ["tokio", "advanced"] }
+iced_fonts = { version = "0.3", features = ["lucide"] }
+mina = "0.1"
+enum-map = "2"
+futures = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
