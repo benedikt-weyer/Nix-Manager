@@ -60,6 +60,12 @@ pub enum CopyTarget {
     Output,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Page {
+    Dashboard,
+    Settings,
+}
+
 pub enum Conn {
     Connecting,
     Online(Client),
@@ -128,8 +134,14 @@ const MAX_LOG_LINES: usize = 2000;
 
 pub struct App {
     pub conn: Conn,
+    /// The applied target: what actions use and what is persisted.
     pub config_dir: String,
     pub host_name: String,
+    pub page: Page,
+    /// What the settings page inputs currently say; becomes the applied
+    /// target on Apply.
+    pub draft_config_dir: String,
+    pub draft_host_name: String,
     /// What the backend falls back to when a field is empty, once it has said.
     pub default_config_dir: Option<String>,
     pub default_host_name: Option<String>,
@@ -154,8 +166,13 @@ pub enum Message {
     WatchEnded,
     RefreshStatus,
     StatusLoaded(SystemTarget, Result<FlakeStatusReply, String>),
-    ConfigDirChanged(String),
-    HostNameChanged(String),
+    OpenSettings,
+    CloseSettings,
+    DraftConfigDirChanged(String),
+    DraftHostNameChanged(String),
+    ApplySettings,
+    RevertDraft,
+    UseDefaults,
     Start(Action),
     StartRejected(String),
     Hover(usize, bool),
@@ -199,6 +216,9 @@ impl App {
             conn: Conn::Connecting,
             config_dir: from_env("NIX_BACKEND_CONFIG_DIR", &saved.config_dir),
             host_name: from_env("NIX_BACKEND_HOST_NAME", &saved.host_name),
+            page: Page::Dashboard,
+            draft_config_dir: String::new(),
+            draft_host_name: String::new(),
             default_config_dir: None,
             default_host_name: None,
             saved,
@@ -213,6 +233,9 @@ impl App {
             fx: Fx::new(),
             last_frame: None,
         };
+        let mut app = app;
+        app.draft_config_dir = app.config_dir.clone();
+        app.draft_host_name = app.host_name.clone();
         (app, connect())
     }
 
@@ -235,6 +258,23 @@ impl App {
             "" => self.default_host_name.as_deref().unwrap_or(&self.local_hostname),
             typed => typed,
         }
+    }
+
+    /// Whether the settings page has edits that aren't applied yet.
+    pub fn settings_dirty(&self) -> bool {
+        self.draft_config_dir.trim() != self.config_dir.trim() || self.draft_host_name.trim() != self.host_name.trim()
+    }
+
+    fn revert_draft(&mut self) {
+        self.draft_config_dir = self.config_dir.clone();
+        self.draft_host_name = self.host_name.clone();
+    }
+
+    /// Switches page and plays the entrance of the new content.
+    fn show(&mut self, page: Page) {
+        self.page = page;
+        self.fx.restart(Slot::Overview, 0.0);
+        self.fx.restart(Slot::Actions, 0.08);
     }
 
     fn persist(&mut self) {
@@ -340,17 +380,52 @@ impl App {
                 self.status = Some(status);
                 Task::none()
             }
-            Message::ConfigDirChanged(value) => {
-                self.saved.config_dir = value.trim().to_owned();
-                self.config_dir = value;
-                self.persist();
+            Message::OpenSettings => {
+                self.revert_draft();
+                self.show(Page::Settings);
                 Task::none()
             }
-            Message::HostNameChanged(value) => {
-                self.saved.host_name = value.trim().to_owned();
-                self.host_name = value;
-                self.persist();
+            Message::CloseSettings => {
+                self.show(Page::Dashboard);
                 Task::none()
+            }
+            Message::DraftConfigDirChanged(value) => {
+                self.draft_config_dir = value;
+                Task::none()
+            }
+            Message::DraftHostNameChanged(value) => {
+                self.draft_host_name = value;
+                Task::none()
+            }
+            Message::RevertDraft => {
+                self.revert_draft();
+                Task::none()
+            }
+            Message::UseDefaults => {
+                self.draft_config_dir.clear();
+                self.draft_host_name.clear();
+                Task::none()
+            }
+            Message::ApplySettings => {
+                if !self.settings_dirty() {
+                    return Task::none();
+                }
+                let (dir, host) = (self.draft_config_dir.trim().to_owned(), self.draft_host_name.trim().to_owned());
+                // Only fields the user changed are persisted, so a value that
+                // merely came from the environment doesn't get saved with them.
+                if dir != self.config_dir.trim() {
+                    self.saved.config_dir = dir.clone();
+                }
+                if host != self.host_name.trim() {
+                    self.saved.host_name = host.clone();
+                }
+                self.config_dir = dir;
+                self.host_name = host;
+                self.notice = None;
+                self.persist();
+                // Forget what we knew about the old target.
+                self.status = None;
+                self.load_status()
             }
             Message::Start(action) => {
                 let Some(mut client) = self.client() else {

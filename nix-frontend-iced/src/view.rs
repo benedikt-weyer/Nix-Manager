@@ -12,27 +12,34 @@ use nix_backend_client::{
 
 use crate::fx::{Fx, Slot, SLIDE};
 use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
-use crate::{Action, App, Conn, CopyTarget, Message, Outcome, Run};
+use crate::{Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
 
 const BOLD: Font = Font { weight: font::Weight::Semibold, ..Font::DEFAULT };
 
 pub fn view(app: &App) -> Element<'_, Message> {
     let fx = &app.fx;
 
-    let mut sections = column![
-        reveal(fx, Slot::Header, header(app)),
-        reveal(fx, Slot::Overview, overview(app)),
-        reveal(fx, Slot::Actions, actions(app)),
-    ]
-    .spacing(SLIDE_GAP);
+    let mut sections = column![reveal(fx, Slot::Header, header(app))].spacing(SLIDE_GAP);
 
-    if let Some(notice) = &app.notice {
-        sections = sections.push(notice_banner(notice));
+    match app.page {
+        Page::Dashboard => {
+            sections =
+                sections.push(reveal(fx, Slot::Overview, overview(app))).push(reveal(fx, Slot::Actions, actions(app)));
+            if let Some(notice) = &app.notice {
+                sections = sections.push(notice_banner(notice));
+            }
+            sections = sections.push(match &app.run {
+                Some(run) => reveal(fx, Slot::Activity, activity(app, run)),
+                None => idle_panel(),
+            });
+        }
+        Page::Settings => {
+            if let Some(notice) = &app.notice {
+                sections = sections.push(notice_banner(notice));
+            }
+            sections = sections.push(reveal(fx, Slot::Overview, settings(app)));
+        }
     }
-    sections = sections.push(match &app.run {
-        Some(run) => reveal(fx, Slot::Activity, activity(app, run)),
-        None => idle_panel(),
-    });
 
     container(scrollable(container(sections.max_width(1000)).padding(28).center_x(Length::Fill)))
         .width(Length::Fill)
@@ -75,7 +82,10 @@ fn header(app: &App) -> Element<'_, Message> {
         column![text("Nix Manager").size(26).font(BOLD), text(subtitle).size(13).color(MUTED)].spacing(2),
         space::horizontal(),
         connection_pill(app),
-        refresh_button(app),
+        match app.page {
+            Page::Dashboard => Element::from(row![refresh_button(app), settings_button()].spacing(4)),
+            Page::Settings => back_button(),
+        },
     ]
     .spacing(14)
     .align_y(Alignment::Center)
@@ -114,6 +124,22 @@ fn connection_pill(app: &App) -> Element<'_, Message> {
         .into(),
         _ => pill.into(),
     }
+}
+
+fn settings_button<'a>() -> Element<'a, Message> {
+    button(centered_icon(lucide::settings(), 16.0, MUTED))
+        .padding(10)
+        .style(ghost_button)
+        .on_press(Message::OpenSettings)
+        .into()
+}
+
+fn back_button<'a>() -> Element<'a, Message> {
+    button(row![lucide::arrow_left().size(14), text("Back").size(13)].spacing(8).align_y(Alignment::Center))
+        .padding([8, 14])
+        .style(ghost_button)
+        .on_press(Message::CloseSettings)
+        .into()
 }
 
 fn refresh_button(app: &App) -> Element<'_, Message> {
@@ -199,43 +225,129 @@ fn flake_card(app: &App) -> Element<'_, Message> {
 }
 
 fn target_card(app: &App) -> Element<'_, Message> {
-    let field =
-        |icon: Text<'static>, label: &'static str, placeholder: &str, value: &str, on_input: fn(String) -> Message| {
-            column![
-                row![icon.size(13).color(MUTED), text(label).size(12).color(MUTED)]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                text_input(placeholder, value)
-                    .on_input(on_input)
-                    .on_submit(Message::RefreshStatus)
-                    .padding(10)
-                    .size(14)
-                    .style(theme::input),
-            ]
-            .spacing(6)
-        };
+    let line = |icon: Text<'static>, value: &str, is_default: bool| {
+        let mut line = row![
+            icon.size(14).color(MUTED),
+            text(value.to_owned()).size(14).font(Font::MONOSPACE).wrapping(Wrapping::None),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        if is_default {
+            line =
+                line.push(container(text("default").size(11).color(MUTED)).padding([2, 8]).style(theme::chip(MUTED)));
+        }
+        line
+    };
 
     container(
         column![
-            field(
-                lucide::folder(),
-                "Config directory",
-                &format!("Default: {}", app.effective_config_dir()),
-                &app.config_dir,
-                Message::ConfigDirChanged
-            ),
-            field(
-                lucide::server(),
-                "Host name",
-                &format!("Default: {}", app.effective_host_name()),
-                &app.host_name,
-                Message::HostNameChanged
-            ),
+            row![
+                text("Target").size(13).color(MUTED).font(BOLD),
+                space::horizontal(),
+                button(row![lucide::pencil().size(12), text("Edit").size(12)].spacing(6).align_y(Alignment::Center))
+                    .padding([4, 10])
+                    .style(ghost_button)
+                    .on_press(Message::OpenSettings),
+            ]
+            .align_y(Alignment::Center),
+            line(lucide::folder(), app.effective_config_dir(), app.config_dir.trim().is_empty()),
+            line(lucide::server(), app.effective_host_name(), app.host_name.trim().is_empty()),
         ]
         .spacing(12),
     )
     .padding(20)
     .width(Length::FillPortion(1))
+    .style(theme::card)
+    .into()
+}
+
+// -------------------------------------------------------------- settings --
+
+fn settings(app: &App) -> Element<'_, Message> {
+    let dirty = app.settings_dirty();
+    let field =
+        |icon: Text<'static>, label: &'static str, default: &str, value: &str, on_input: fn(String) -> Message| {
+            column![
+                row![icon.size(13).color(MUTED), text(label).size(13).color(MUTED)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                text_input(&format!("Default: {default}"), value)
+                    .on_input(on_input)
+                    .on_submit(Message::ApplySettings)
+                    .padding(12)
+                    .size(14)
+                    .style(theme::input),
+                text(format!("Leave empty to use the default ({default}).")).size(12).color(MUTED),
+            ]
+            .spacing(6)
+        };
+
+    let apply = if dirty {
+        button(row![lucide::check().size(14), text("Apply").size(14).font(BOLD)].spacing(8).align_y(Alignment::Center))
+            .padding([9, 18])
+            .style(theme::primary_button)
+            .on_press(Message::ApplySettings)
+    } else {
+        button(
+            row![lucide::check().size(14).color(SUCCESS), text("Applied").size(14).color(SUCCESS)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        )
+        .padding([9, 18])
+        .style(ghost_button)
+    };
+    let ghost = |icon: Text<'static>, label: &'static str, message: Message, enabled: bool| {
+        let color = if enabled { TEXT } else { theme::with_alpha(MUTED, 0.5) };
+        button(
+            row![icon.size(13).color(color), text(label).size(13).color(color)].spacing(8).align_y(Alignment::Center),
+        )
+        .padding([9, 14])
+        .style(ghost_button)
+        .on_press_maybe(enabled.then_some(message))
+    };
+    let has_values = !app.draft_config_dir.trim().is_empty() || !app.draft_host_name.trim().is_empty();
+
+    container(
+        column![
+            row![
+                icon_tile(lucide::settings(), ACCENT, 20.0, 42.0, 0.0),
+                column![
+                    text("Target").size(18).font(BOLD),
+                    text("Which flake and host updates and rebuilds operate on. Saved on this machine.")
+                        .size(13)
+                        .color(MUTED),
+                ]
+                .spacing(2),
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center),
+            field(
+                lucide::folder(),
+                "Config directory",
+                app.default_config_dir.as_deref().unwrap_or("/etc/nixos"),
+                &app.draft_config_dir,
+                Message::DraftConfigDirChanged
+            ),
+            field(
+                lucide::server(),
+                "Host name",
+                app.default_host_name.as_deref().unwrap_or(app.effective_host_name()),
+                &app.draft_host_name,
+                Message::DraftHostNameChanged
+            ),
+            row![
+                apply,
+                ghost(lucide::rotate_ccw(), "Revert", Message::RevertDraft, dirty),
+                space::horizontal(),
+                ghost(lucide::eraser(), "Use defaults", Message::UseDefaults, has_values),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(20),
+    )
+    .padding(24)
+    .width(Length::Fill)
     .style(theme::card)
     .into()
 }

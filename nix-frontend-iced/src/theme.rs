@@ -124,6 +124,22 @@ pub fn well(_: &Theme) -> container::Style {
     }
 }
 
+pub fn primary_button(_: &Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
+    use iced::widget::button::Status;
+    let fill = match status {
+        Status::Hovered => mix(ACCENT, Color::WHITE, 0.15),
+        Status::Pressed => mix(ACCENT, BG, 0.2),
+        _ => ACCENT,
+    };
+    iced::widget::button::Style {
+        background: Some(Background::Color(fill)),
+        text_color: BG,
+        border: Border { radius: Radius::from(10.0), ..Default::default() },
+        shadow: Shadow { color: with_alpha(ACCENT, 0.35), offset: Vector::new(0.0, 4.0), blur_radius: 14.0 },
+        ..Default::default()
+    }
+}
+
 pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
     let border = match status {
         text_input::Status::Focused { .. } => ACCENT,
