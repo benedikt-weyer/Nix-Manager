@@ -26,7 +26,8 @@ fi
 
 instances=1
 profile=debug
-mode=both # both | backend | frontend
+mode=both # both | backend | frontend | cli
+cli_args=()
 
 while (($#)); do
     case "$1" in
@@ -36,6 +37,7 @@ while (($#)); do
         -H|--host) export NIX_BACKEND_HOST_NAME="${2:?missing value for $1}"; shift ;;
         -b|--backend-only) mode=backend ;;
         -f|--frontend-only) mode=frontend ;;
+        --cli) mode=cli; shift; cli_args=("$@"); break ;;
         -h|--help) exec "$ROOT/scripts/help" ;;
         *) die "unknown option: $1 (see ./scripts/help)" ;;
     esac
@@ -58,7 +60,8 @@ socket_alive() {
 
 info "Building ($profile)"
 [[ $mode != frontend ]] && cargo build "${cargo_flags[@]}" --manifest-path nix-backend-generic/Cargo.toml
-[[ $mode != backend ]] && cargo build "${cargo_flags[@]}" -p nix-frontend-iced
+[[ $mode == both || $mode == frontend ]] && cargo build "${cargo_flags[@]}" -p nix-frontend-iced
+[[ $mode == cli ]] && cargo build "${cargo_flags[@]}" -p nix-frontend-cli
 
 backend_pid=
 frontend_pids=()
@@ -94,6 +97,12 @@ if [[ $mode == backend ]]; then
     info "Backend only - attach frontends with: ./scripts/run --frontend-only (Ctrl-C to stop)"
     wait "$backend_pid"
     exit
+fi
+
+if [[ $mode == cli ]]; then
+    # Not exec'd, so the trap still stops a backend we started.
+    "$ROOT/target/$profile/nix-manager" "${cli_args[@]}" && status=0 || status=$?
+    exit "$status"
 fi
 
 info "Starting $instances frontend instance(s)"

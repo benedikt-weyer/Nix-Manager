@@ -13,6 +13,15 @@ Run
   ./scripts/run -b                     backend only, in the foreground
   ./scripts/run -f                     only a frontend window, attached to a running dev backend
   ./scripts/run -r                     release build
+  ./scripts/run --cli status           run the CLI against the dev backend (starts one if needed);
+                                       everything after --cli goes to the CLI, e.g. --cli rebuild test
+
+CLI (nix-frontend-cli, binary `nix-manager`)
+  nix-manager status | update | rebuild [switch|boot|test] | watch
+  nix-manager -c DIR -H HOST -s SOCKET -q ...            (global flags)
+  zsh tab completion:   source <(nix-manager completions zsh)      (needs compinit)
+  or install it:        nix-manager completions zsh > ~/.zfunc/_nix-manager    (~/.zfunc in fpath)
+  also: completions bash | fish | elvish | powershell
   ./scripts/run -c DIR -H HOST         point the backend at a flake directory / nixosConfiguration
 
   The backend uses its own socket ($XDG_RUNTIME_DIR/nix-manager-dev.sock), so it never
@@ -39,6 +48,7 @@ Layout
   nix-backend-generic/    gRPC backend (standalone crate; owns proto/nix_backend.proto)
   nix-backend-client/     frontend-agnostic client library shared by every frontend
   nix-frontend-iced/      iced + mina GUI frontend
+  nix-frontend-cli/       command-line frontend
 
 One backend serves any number of frontend instances at once: they all follow the same
 operation through the backend's Watch stream, and only one update/rebuild runs at a time.

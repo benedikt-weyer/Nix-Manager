@@ -1,0 +1,17 @@
+[package]
+name = "nix-frontend-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line frontend for the Nix-Manager backend"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "nix-manager"
+path = "src/main.rs"
+
+[dependencies]
+nix-backend-client = { path = "../nix-backend-client" }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

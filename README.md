@@ -9,6 +9,7 @@ One backend serves any number of frontend instances at the same time.
 | `nix-backend-generic/` | gRPC backend over a unix socket. Owns `proto/nix_backend.proto`. |
 | `nix-backend-client/` | Frontend-agnostic client library shared by every frontend. |
 | `nix-frontend-iced/` | [iced](https://iced.rs) frontend with [mina](https://crates.io/crates/mina) animations and Lucide icons. |
+| `nix-frontend-cli/` | Command-line frontend (`nix-manager`) with shell completions. |
 
 ## Development
 
@@ -22,6 +23,14 @@ direnv allow        # or: nix develop
 Flakes only see git-tracked files: `git add flake.nix flake.lock` before using `direnv`/`nix develop`.
 
 `./scripts/run` defaults to operating on `/etc/nixos`; use `-c DIR -H HOST` to point it at a scratch flake while developing.
+
+## CLI
+
+```sh
+./scripts/run --cli status           # against the dev backend
+nix-manager rebuild test             # against a real one
+source <(nix-manager completions zsh)   # zsh tab completion (after compinit)
+```
 
 ## Multiple frontends
 
