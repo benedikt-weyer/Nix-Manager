@@ -1,4 +1,5 @@
 mod fx;
+mod inbox;
 mod store;
 mod theme;
 mod view;
@@ -12,11 +13,12 @@ use iced::widget::text_editor;
 use iced::{window, Subscription, Task};
 use nix_backend_client::settings::{self, Settings};
 use nix_backend_client::{
-    BuildItem, BuildStats, Client, Destination, EventPhase, FlakeStatusReply, OperationEvent, OperationKind, Package,
-    ProgressEvent, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
+    BuildItem, BuildStats, Client, Destination, EventPhase, FlakeStatusReply, OperationKind, Package, RebuildMode,
+    SearchPackagesReply, SetConfigPackageReply, SystemTarget,
 };
 
 use fx::{Fx, Slot};
+use inbox::{End, Inbox, Segment};
 use store::{Banner, BannerAction, Detail, Load, Snippet, Store, Tab};
 
 const ICON_PNG: &[u8] = include_bytes!("../../assets/icons/nix-manager-256.png");
@@ -155,6 +157,8 @@ const MAX_LOG_LINES: usize = 2000;
 
 pub struct App {
     pub conn: Conn,
+    /// Backend events waiting to be shown; see `inbox`.
+    inbox: Arc<Inbox>,
     /// The applied target: what actions use and what is persisted.
     pub config_dir: String,
     pub host_name: String,
@@ -197,7 +201,9 @@ pub enum Message {
     Frame(Instant),
     Retry,
     Connected(Result<Client, String>),
-    Watch(Result<OperationEvent, String>),
+    /// The backend sent something; it waits in `App::inbox` for the next frame.
+    Inbound,
+    WatchFailed(String),
     WatchEnded,
     RefreshStatus,
     StatusLoaded(SystemTarget, Result<FlakeStatusReply, String>),
@@ -259,14 +265,25 @@ fn connect() -> Task<Message> {
     )
 }
 
-fn watch(mut client: Client) -> Task<Message> {
-    Task::future(async move { client.watch().await.map_err(status_text) }).then(|result| match result {
-        Ok(stream) => Task::stream(
-            stream
-                .map(|item| Message::Watch(item.map_err(status_text)))
-                .chain(futures::stream::once(async { Message::WatchEnded })),
-        ),
-        Err(error) => Task::done(Message::Watch(Err(error))),
+/// Follows the backend's events. Each goes into `inbox` rather than becoming a
+/// message of its own; the UI is only woken when the inbox goes from empty to
+/// not empty, and reads it on its next frame.
+fn watch(mut client: Client, inbox: Arc<Inbox>) -> Task<Message> {
+    Task::future(async move { client.watch().await.map_err(status_text) }).then(move |result| match result {
+        Ok(stream) => {
+            let inbox = inbox.clone();
+            Task::stream(
+                stream
+                    .filter_map(move |item| {
+                        futures::future::ready(match item {
+                            Ok(op) => inbox.push(op).then_some(Message::Inbound),
+                            Err(error) => Some(Message::WatchFailed(status_text(error))),
+                        })
+                    })
+                    .chain(futures::stream::once(async { Message::WatchEnded })),
+            )
+        }
+        Err(error) => Task::done(Message::WatchFailed(error)),
     })
 }
 
@@ -280,6 +297,7 @@ impl App {
         };
         let app = Self {
             conn: Conn::Connecting,
+            inbox: Arc::default(),
             config_dir: from_env("NIX_BACKEND_CONFIG_DIR", &saved.config_dir),
             host_name: from_env("NIX_BACKEND_HOST_NAME", &saved.host_name),
             editor: saved.editor.clone(),
@@ -417,7 +435,7 @@ impl App {
                 let dt = self.last_frame.map_or(0.0, |last| now.duration_since(last).as_secs_f32());
                 self.last_frame = Some(now);
                 self.fx.tick(dt.min(0.05));
-                Task::none()
+                self.drain_inbox()
             }
             Message::Retry => {
                 if matches!(self.conn, Conn::Offline(_)) {
@@ -433,7 +451,7 @@ impl App {
                 } else {
                     Task::none()
                 };
-                Task::batch([self.load_status(), watch(client), store])
+                Task::batch([self.load_status(), watch(client, self.inbox.clone()), store])
             }
             Message::Connected(Err(error)) => {
                 self.go_offline(error);
@@ -445,13 +463,21 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Watch(Err(error)) => {
+            Message::WatchFailed(error) => {
                 if matches!(self.conn, Conn::Online(_)) {
                     self.go_offline(error);
                 }
                 Task::none()
             }
-            Message::Watch(Ok(op)) => self.apply(op),
+            // While frames are running the next one reads the inbox; the wake-up
+            // matters when nothing is moving and so no frame is coming.
+            Message::Inbound => {
+                if self.fx.animating() {
+                    Task::none()
+                } else {
+                    self.drain_inbox()
+                }
+            }
             Message::RefreshStatus => {
                 self.status = None;
                 self.load_status()
@@ -913,19 +939,25 @@ impl App {
         )
     }
 
-    /// Folds one backend event into the activity panel.
-    fn apply(&mut self, op: OperationEvent) -> Task<Message> {
-        let Some(event) = op.event.clone() else {
+    /// Shows what the backend sent since the last frame: one update however
+    /// much arrived, and for the state only the newest of it.
+    fn drain_inbox(&mut self) -> Task<Message> {
+        let segments = self.inbox.take();
+        if segments.is_empty() {
             return Task::none();
-        };
-        let kind = op.kind();
-        let mode = op.mode();
+        }
+        let tasks: Vec<Task<Message>> = segments.into_iter().map(|segment| self.apply_segment(segment)).collect();
+        self.sync_log();
+        Task::batch(tasks)
+    }
 
-        // The previous run is over (or there was none): this event belongs to
-        // a new operation, started here or by another instance, or replayed
-        // to us as a late joiner.
+    /// Folds what arrived for one operation into the activity panel.
+    fn apply_segment(&mut self, segment: Segment) -> Task<Message> {
+        // The previous run is over (or there was none): this belongs to a new
+        // operation, started here or by another instance, or replayed to us as
+        // a late joiner.
         if self.run.as_ref().is_none_or(|run| !run.running()) {
-            self.run = Some(Run::new(kind, mode));
+            self.run = Some(Run::new(segment.kind, segment.mode));
             self.log_view = text_editor::Content::new();
             self.log_pending.clear();
             self.fx.reset_progress();
@@ -933,24 +965,35 @@ impl App {
         }
         let run = self.run.as_mut().expect("run was just ensured");
 
-        let phase = event.phase();
-        run.phase = phase;
-        let message = nix_backend_client::strip_ansi(&event.message);
-        if !message.is_empty() {
-            run.message = message.lines().next().unwrap_or_default().to_owned();
-            for line in message.lines() {
-                run.log.push_back(line.to_owned());
-                self.log_pending.push(line.to_owned());
-                if run.log.len() > MAX_LOG_LINES {
-                    run.log.pop_front();
-                }
-            }
-            sync_log(&mut self.log_view, &mut self.log_pending, self.log_hovered, &run.log);
+        run.phase = segment.phase;
+        if let Some(status) = segment.status {
+            run.message = status;
         }
-        absorb_progress(run, &event, &mut self.fx);
+        let skipped = (segment.skipped > 0).then(|| {
+            format!("… {} lines were skipped because they arrived faster than they could be shown", segment.skipped)
+        });
+        for line in skipped.into_iter().chain(segment.lines) {
+            run.log.push_back(line.clone());
+            self.log_pending.push(line);
+            if run.log.len() > MAX_LOG_LINES {
+                run.log.pop_front();
+            }
+        }
+        if let Some((stats, items)) = segment.snapshot {
+            run.stats = Some(stats);
+            run.items = items;
+        }
+        if let Some(fraction) = segment.fraction {
+            let fraction = fraction as f32;
+            // Only ever move forward: nix's totals grow as it discovers more work.
+            if run.fraction.is_none_or(|current| fraction > current) {
+                run.fraction = Some(fraction);
+                self.fx.set_progress(fraction);
+            }
+        }
 
-        match phase {
-            EventPhase::Finished => {
+        match segment.end {
+            Some(End::Finished) => {
                 run.outcome = Outcome::Succeeded;
                 run.items.clear();
                 run.fraction = Some(1.0);
@@ -959,16 +1002,15 @@ impl App {
                 // and what the configuration installs.
                 self.store.installed = Load::Idle;
                 let installed = if self.page == Page::Store { self.load_installed() } else { Task::none() };
-                return Task::batch([self.load_status(), installed]);
+                Task::batch([self.load_status(), installed])
             }
-            EventPhase::Failed => {
+            Some(End::Failed(message)) => {
                 run.outcome = Outcome::Failed(message);
                 run.items.clear();
-                return self.load_status();
+                self.load_status()
             }
-            _ => {}
+            None => Task::none(),
         }
-        Task::none()
     }
 
     fn view(&self) -> iced::Element<'_, Message> {
@@ -977,7 +1019,8 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         let mut subscriptions = Vec::new();
-        if self.fx.animating() {
+        // Frames also run while events wait, so the next one shows them.
+        if self.fx.animating() || self.inbox.has_pending() {
             subscriptions.push(window::frames().map(Message::Frame));
         }
         if matches!(self.conn, Conn::Offline(_)) {
@@ -1049,23 +1092,6 @@ fn open_url(url: &str) {
         std::thread::spawn(move || {
             let _ = child.wait();
         });
-    }
-}
-
-/// Copies the live build data out of an event. Plain log lines carry no
-/// stats and must not wipe the last snapshot.
-fn absorb_progress(run: &mut Run, event: &ProgressEvent, fx: &mut Fx) {
-    if let Some(stats) = &event.stats {
-        run.stats = Some(stats.clone());
-        run.items = event.active_items.clone();
-    }
-    if event.fraction_done >= 0.0 {
-        let fraction = event.fraction_done as f32;
-        // Only ever move forward: nix's totals grow as it discovers more work.
-        if run.fraction.is_none_or(|current| fraction > current) {
-            run.fraction = Some(fraction);
-            fx.set_progress(fraction);
-        }
     }
 }
 
@@ -1160,5 +1186,76 @@ mod tests {
         assert!(missing.contains("definitely-not-an-editor-xyz") && missing.contains("Settings"), "{missing}");
         assert!(open_in_editor("  ", dir).unwrap_err().contains("No editor"));
         assert!(open_in_editor("zed", "/no/such/dir").unwrap_err().contains("not a directory"));
+    }
+
+    fn backend_event(phase: EventPhase, message: &str, builds_done: Option<i64>) -> nix_backend_client::OperationEvent {
+        use nix_backend_client::proto::ProgressEvent;
+        nix_backend_client::OperationEvent {
+            kind: OperationKind::Rebuild as i32,
+            mode: RebuildMode::BuildOnly as i32,
+            event: Some(ProgressEvent {
+                phase: phase as i32,
+                message: message.to_owned(),
+                is_error: false,
+                fraction_done: builds_done.map_or(-1.0, |done| done as f64 / 1000.0),
+                active_items: Vec::new(),
+                stats: builds_done.map(|builds_done| BuildStats { builds_done, ..Default::default() }),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_burst_is_shown_as_its_newest_state_and_all_its_output() {
+        let (mut app, _) = App::new();
+        for i in 1..=1000 {
+            app.inbox.push(backend_event(EventPhase::Build, &format!("line {i}"), Some(i)));
+        }
+
+        // One read, however much arrived.
+        let _ = app.drain_inbox();
+        let run = app.run.as_ref().expect("a run was started");
+        assert_eq!(run.log.len(), 1000, "no output line is lost");
+        assert_eq!(run.log.front().map(String::as_str), Some("line 1"));
+        assert_eq!(run.message, "line 1000", "the status is the newest");
+        assert_eq!(run.stats.as_ref().unwrap().builds_done, 1000, "so is the snapshot");
+        assert_eq!(run.fraction, Some(1.0));
+        assert!(run.running());
+        assert!(!app.inbox.has_pending());
+    }
+
+    #[test]
+    fn a_finish_in_the_same_burst_is_not_lost() {
+        let (mut app, _) = App::new();
+        app.inbox.push(backend_event(EventPhase::Build, "working", Some(5)));
+        app.inbox.push(backend_event(EventPhase::Finished, "Build complete", None));
+
+        let _ = app.drain_inbox();
+        let run = app.run.as_ref().unwrap();
+        assert!(matches!(run.outcome, Outcome::Succeeded));
+        assert!(run.items.is_empty());
+    }
+
+    #[test]
+    fn a_failure_in_the_same_burst_carries_its_text() {
+        let (mut app, _) = App::new();
+        app.inbox.push(backend_event(EventPhase::Build, "working", None));
+        app.inbox.push(backend_event(EventPhase::Failed, "Build failed: boom", None));
+
+        let _ = app.drain_inbox();
+        assert!(matches!(&app.run.as_ref().unwrap().outcome, Outcome::Failed(text) if text == "Build failed: boom"));
+    }
+
+    #[test]
+    fn the_next_operation_starts_a_fresh_run() {
+        let (mut app, _) = App::new();
+        app.inbox.push(backend_event(EventPhase::Finished, "done", None));
+        let _ = app.drain_inbox();
+        assert!(!app.run.as_ref().unwrap().running());
+
+        app.inbox.push(backend_event(EventPhase::Build, "again", Some(1)));
+        let _ = app.drain_inbox();
+        let run = app.run.as_ref().unwrap();
+        assert!(run.running());
+        assert_eq!(run.log.len(), 1);
     }
 }
