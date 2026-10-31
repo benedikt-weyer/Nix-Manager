@@ -90,6 +90,8 @@
             src = backendSrc;
             strictDeps = true;
             nativeBuildInputs = [ pkgs.protobuf ];
+            # The git module's tests run real git commands.
+            nativeCheckInputs = [ pkgs.git ];
           };
 
           nix-backend-generic = craneLib.buildPackage (
