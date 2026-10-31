@@ -47,6 +47,9 @@ enum Command {
         /// Extra arguments for `nix build`, after `--` [default: the nix options saved in the GUI's settings]
         #[arg(last = true)]
         nix_args: Vec<String>,
+        /// Build as yourself instead of as root; the nix daemon then ignores download settings like download-attempts
+        #[arg(long)]
+        no_root: bool,
     },
     /// Follow the running (or next) operation, e.g. one started from a GUI; exits when it ends
     Watch,
@@ -125,13 +128,11 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
             let stream = client.update_flake(target).await.map_err(|s| s.message().to_owned())?;
             follow(stream, &mut printer).await
         }
-        Command::Rebuild { mode, nix_args } => {
-            let nix_args = if nix_args.is_empty() {
-                nix_backend_client::settings::nix_args(&nix_backend_client::settings::Settings::load().nix_options)
-            } else {
-                nix_args
-            };
-            let stream = client.rebuild(target, mode.into(), nix_args).await.map_err(|s| s.message().to_owned())?;
+        Command::Rebuild { mode, nix_args, no_root } => {
+            let settings = nix_backend_client::settings::Settings::load();
+            let nix_args = if nix_args.is_empty() { nix_backend_client::settings::nix_args(&settings.nix_options) } else { nix_args };
+            let build_as_root = settings.build_as_root() && !no_root;
+            let stream = client.rebuild(target, mode.into(), nix_args, build_as_root).await.map_err(|s| s.message().to_owned())?;
             follow(stream, &mut printer).await
         }
         Command::Watch => {

@@ -178,6 +178,8 @@ pub struct App {
     pub agent: String,
     /// The extra `nix build` arguments for rebuilds; empty means the default.
     pub nix_options: String,
+    /// Whether rebuilds run `nix build` as root. Applies immediately.
+    pub build_as_root: bool,
     pub page: Page,
     /// What the settings page inputs currently say; becomes the applied
     /// target on Apply.
@@ -232,6 +234,7 @@ pub enum Message {
     DraftEditorChanged(String),
     DraftAgentChanged(String),
     DraftNixOptionsChanged(String),
+    SetBuildAsRoot(bool),
     OpenConfig,
     ApplySettings,
     RevertDraft,
@@ -349,6 +352,7 @@ impl App {
             editor: saved.editor.clone(),
             agent: saved.agent.clone(),
             nix_options: saved.nix_options.clone(),
+            build_as_root: saved.build_as_root(),
             page: Page::Dashboard,
             draft_config_dir: String::new(),
             draft_host_name: String::new(),
@@ -597,6 +601,12 @@ impl App {
                 self.draft_nix_options = value;
                 Task::none()
             }
+            Message::SetBuildAsRoot(enabled) => {
+                self.build_as_root = enabled;
+                self.saved.build_as_root = Some(enabled);
+                self.persist();
+                Task::none()
+            }
             Message::OpenConfig => {
                 self.notice = open_in_editor(self.effective_editor(), self.effective_config_dir()).err();
                 Task::none()
@@ -664,6 +674,7 @@ impl App {
                 self.notice = None;
                 let target = self.target();
                 let nix_args = settings::nix_args(&self.nix_options);
+                let build_as_root = self.build_as_root;
                 // The progress comes back through `Watch`; the stream returned
                 // here is only dropped. Its only use is the rejection when
                 // another instance already has an operation running.
@@ -671,7 +682,7 @@ impl App {
                     async move {
                         match action {
                             Action::Update => client.update_flake(target).await.map(drop),
-                            Action::Rebuild(mode) => client.rebuild(target, mode, nix_args).await.map(drop),
+                            Action::Rebuild(mode) => client.rebuild(target, mode, nix_args, build_as_root).await.map(drop),
                         }
                         .map_err(status_text)
                     },

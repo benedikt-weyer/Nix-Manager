@@ -211,17 +211,41 @@ fn no_new_privs() -> bool {
         .unwrap_or(false)
 }
 
-pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[String], tx: EventTx) {
+/// What `pkexec` would otherwise wipe from the environment but a root `nix`
+/// still needs: where to find programs (git, ssh), certificates and proxies
+/// for fetching flake inputs.
+const FORWARDED_ENV: &[&str] =
+    &["PATH", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"];
+
+/// The command that runs `nix <nix_args>` as root through `pkexec`. The nix
+/// daemon only honors settings such as `download-attempts` and
+/// `http-connections` from trusted users, and root is one. The flake belongs
+/// to the user, so git is told to trust its directory instead of refusing it
+/// as owned by someone else.
+fn elevated_nix(config_dir: &str, nix_args: Vec<String>) -> (&'static str, Vec<String>) {
+    let mut args = vec![find_in_path("env").unwrap_or_else(|| "env".to_owned())];
+    args.extend(FORWARDED_ENV.iter().filter_map(|name| std::env::var(name).ok().map(|value| format!("{name}={value}"))));
+    args.extend(
+        ["GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory"].map(str::to_owned),
+    );
+    args.push(format!("GIT_CONFIG_VALUE_0={config_dir}"));
+    args.push(find_in_path("nix").unwrap_or_else(|| "nix".to_owned()));
+    args.extend(nix_args);
+    ("pkexec", args)
+}
+
+pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[String], build_as_root: bool, tx: EventTx) {
     let action = mode_label(mode);
     send(&tx, EventPhase::Started, format!("Rebuilding '{}' ({action})", target.host_name), false).await;
 
-    if mode != RebuildMode::BuildOnly && no_new_privs() {
+    // A root build needs pkexec in every mode; otherwise only activation does.
+    if (build_as_root || mode != RebuildMode::BuildOnly) && no_new_privs() {
         send(
             &tx,
             EventPhase::Failed,
             "Cannot elevate: this backend runs with no_new_privs set (inherited from the process that started it), \
              so pkexec can't work. Start the backend from a regular session or the systemd user service - or use \
-             the build-only mode, which needs no privileges.",
+             the build-only mode with the root build turned off, which needs no privileges.",
             true,
         )
         .await;
@@ -234,10 +258,18 @@ pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[Str
         target.config_dir, target.host_name
     );
 
-    let mut build_args = vec!["build", &flake_attr, "--out-link", &out_link, "--log-format", "internal-json", "-v"];
-    build_args.extend(nix_args.iter().map(String::as_str));
+    let mut build_args: Vec<String> =
+        ["build", &flake_attr, "--out-link", &out_link, "--log-format", "internal-json", "-v"].map(str::to_owned).into();
+    build_args.extend(nix_args.iter().cloned());
+    let (program, build_args) = if build_as_root {
+        send(&tx, EventPhase::Build, "Building as root (authorization required)", false).await;
+        elevated_nix(&target.config_dir, build_args)
+    } else {
+        ("nix", build_args)
+    };
+    let build_args: Vec<&str> = build_args.iter().map(String::as_str).collect();
 
-    if let Err(e) = run_streamed("nix", &build_args, EventPhase::Build, &tx).await {
+    if let Err(e) = run_streamed(program, &build_args, EventPhase::Build, &tx).await {
         send(&tx, EventPhase::Failed, format!("Build failed: {e}"), true).await;
         return;
     }
@@ -267,7 +299,7 @@ pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[Str
 
     if mode == RebuildMode::BuildOnly {
         // Build only: no generation, no bootloader entry, no activation, and
-        // so no privileged step at all.
+        // so no privileged step beyond the optional root build.
         let _ = tokio::fs::remove_file(&out_link).await;
         send(&tx, EventPhase::Finished, format!("Build complete: {resolved}"), false).await;
         return;

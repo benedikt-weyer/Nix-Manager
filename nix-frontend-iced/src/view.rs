@@ -4,7 +4,7 @@ use chrono::{DateTime, Local, Utc};
 use iced::advanced::text::{highlighter, Highlighter};
 use iced::widget::{
     button, column, container, mouse_area, row, scrollable, space, stack, text, text::Wrapping, text_editor,
-    text_input, Text,
+    text_input, toggler, Text,
 };
 use iced::{font, mouse, Alignment, Color, Element, Font, Length, Padding};
 use iced_fonts::lucide;
@@ -489,7 +489,21 @@ fn actions(app: &App) -> Element<'_, Message> {
         Element::from(area)
     });
 
-    column![text("Actions").size(13).color(MUTED).font(BOLD), row(tiles).spacing(16),].spacing(10).into()
+    let root = row![
+        toggler(app.build_as_root)
+            .label("Build as root")
+            .size(18)
+            .text_size(13)
+            .spacing(10)
+            .on_toggle_maybe((!app.busy()).then_some(Message::SetBuildAsRoot)),
+        text("Lets the nix daemon honor download retries and timeouts. Asks for authorization before each build.")
+            .size(12)
+            .color(MUTED),
+    ]
+    .spacing(14)
+    .align_y(Alignment::Center);
+
+    column![text("Actions").size(13).color(MUTED).font(BOLD), row(tiles).spacing(16), root].spacing(10).into()
 }
 
 // -------------------------------------------------------------- activity --

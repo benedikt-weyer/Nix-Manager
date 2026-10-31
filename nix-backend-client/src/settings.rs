@@ -40,6 +40,9 @@ pub struct Settings {
     /// Extra arguments for `nix build` when rebuilding, as a command line.
     #[serde(default)]
     pub nix_options: String,
+    /// Whether rebuilds run `nix build` as root; unset means yes.
+    #[serde(default)]
+    pub build_as_root: Option<bool>,
 }
 
 /// Splits a command line into words. Whitespace separates words; single or
@@ -90,6 +93,10 @@ pub fn nix_args(typed: &str) -> Vec<String> {
 }
 
 impl Settings {
+    pub fn build_as_root(&self) -> bool {
+        self.build_as_root.unwrap_or(true)
+    }
+
     /// `$XDG_CONFIG_HOME/nix-manager/settings.json`, falling back to
     /// `~/.config/...`. `None` if neither variable is set.
     pub fn path() -> Option<PathBuf> {
@@ -143,6 +150,7 @@ mod tests {
             editor: "code --new-window".to_owned(),
             agent: "gemini --experimental-acp".to_owned(),
             nix_options: "--option download-attempts 3".to_owned(),
+            build_as_root: Some(false),
         };
 
         settings.save_to(&path).unwrap();
@@ -167,6 +175,12 @@ mod tests {
         assert_eq!(nix_args("  "), split_command(DEFAULT_NIX_OPTIONS));
         assert_eq!(nix_args("--keep-going"), ["--keep-going"]);
         assert!(nix_args("").windows(3).any(|w| w == ["--option", "download-attempts", "10"]));
+    }
+
+    #[test]
+    fn builds_as_root_unless_turned_off() {
+        assert!(Settings::default().build_as_root());
+        assert!(!Settings { build_as_root: Some(false), ..Default::default() }.build_as_root());
     }
 
     #[test]

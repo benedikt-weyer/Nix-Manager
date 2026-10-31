@@ -99,6 +99,10 @@ message RebuildRequest {
     // Extra arguments for `nix build`, e.g. ["--option", "download-attempts",
     // "10"]; how the download behaves on a flaky connection.
     repeated string nix_args = 3;
+    // Run `nix build` as root through pkexec. The nix daemon only honors
+    // settings like download-attempts from trusted users, and root is one.
+    // Unset (e.g. an older client) builds as the calling user.
+    bool build_as_root = 4;
 }
 
 message FlakeStatusRequest {
