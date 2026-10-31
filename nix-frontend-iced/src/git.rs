@@ -277,7 +277,7 @@ fn commit_card(app: &App) -> Element<'_, Message> {
     )
 }
 
-fn message_style(_: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
+pub(crate) fn message_style(_: &iced::Theme, status: text_editor::Status) -> text_editor::Style {
     let border = match status {
         text_editor::Status::Focused { .. } => ACCENT,
         text_editor::Status::Hovered => theme::mix(theme::BORDER, ACCENT, 0.4),
@@ -473,7 +473,7 @@ fn diff_lines(diff: &Diff) -> Element<'_, Message> {
     container(scrollable(rows).height(DIFF_HEIGHT).width(Length::Fill)).style(theme::well).clip(true).into()
 }
 
-fn diff_row(line: &Line) -> Element<'_, Message> {
+pub(crate) fn diff_row(line: &Line) -> Element<'_, Message> {
     let number = |n: Option<u32>| n.map_or_else(|| "    ".to_owned(), |n| format!("{n:>4}"));
     let (sign, tint, fill) = match line.kind {
         Kind::Added => ("+", SUCCESS, Some(theme::with_alpha(SUCCESS, 0.13))),

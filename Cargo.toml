@@ -6,5 +6,5 @@
 # RPC in the backend's proto).
 [workspace]
 resolver = "2"
-members = ["nix-backend-client", "nix-frontend-iced", "nix-frontend-cli"]
+members = ["nix-backend-client", "nix-agent-client", "nix-frontend-iced", "nix-frontend-cli"]
 exclude = ["nix-backend-generic"]

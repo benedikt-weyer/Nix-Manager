@@ -1,0 +1,11 @@
+[package]
+name = "nix-agent-client"
+version = "0.1.0"
+edition = "2021"
+description = "Frontend-agnostic Agent Client Protocol client for Nix-Manager: talks to an AI coding agent about the NixOS configuration"
+license = "GPL-3.0-only"
+
+[dependencies]
+agent-client-protocol = { version = "3.6.0", features = ["process"] }
+futures = "0.3"
+similar = "2"

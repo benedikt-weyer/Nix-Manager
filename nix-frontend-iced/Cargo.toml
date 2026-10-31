@@ -11,7 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 nix-backend-client = { path = "../nix-backend-client" }
-iced = { version = "0.14", features = ["tokio", "advanced"] }
+nix-agent-client = { path = "../nix-agent-client" }
+iced = { version = "0.14", features = ["tokio", "advanced", "markdown"] }
 iced_fonts = { version = "0.3", features = ["lucide"] }
 mina = "0.1"
 enum-map = "2"

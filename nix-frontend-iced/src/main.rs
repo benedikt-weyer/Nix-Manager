@@ -1,3 +1,4 @@
+mod ai;
 mod fx;
 mod git;
 mod inbox;
@@ -18,6 +19,7 @@ use nix_backend_client::{
     GitStatusReply, OperationKind, Package, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
 };
 
+use ai::Ai;
 use fx::{Fx, Slot};
 use git::{Diff, Git, Selected};
 use inbox::{End, Inbox, Segment};
@@ -89,6 +91,8 @@ pub enum CopyTarget {
     Snippet(Snippet),
     /// The diff of the open file on the git page.
     Diff,
+    /// The agent's answer, by its position in the conversation.
+    AiAnswer(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -97,6 +101,7 @@ pub enum Page {
     Settings,
     Store,
     Git,
+    Ai,
 }
 
 pub enum Conn {
@@ -169,12 +174,15 @@ pub struct App {
     pub host_name: String,
     /// The command that opens the configuration; empty means the default.
     pub editor: String,
+    /// The command that starts the AI agent; empty means the default.
+    pub agent: String,
     pub page: Page,
     /// What the settings page inputs currently say; becomes the applied
     /// target on Apply.
     pub draft_config_dir: String,
     pub draft_host_name: String,
     pub draft_editor: String,
+    pub draft_agent: String,
     /// What the backend falls back to when a field is empty, once it has said.
     pub default_config_dir: Option<String>,
     pub default_host_name: Option<String>,
@@ -198,6 +206,7 @@ pub struct App {
     pub copied: Option<CopyTarget>,
     pub store: Store,
     pub git: Git,
+    pub ai: Ai,
     pub fx: Fx,
     last_frame: Option<Instant>,
 }
@@ -218,6 +227,7 @@ pub enum Message {
     DraftConfigDirChanged(String),
     DraftHostNameChanged(String),
     DraftEditorChanged(String),
+    DraftAgentChanged(String),
     OpenConfig,
     ApplySettings,
     RevertDraft,
@@ -272,6 +282,18 @@ pub enum Message {
     GitCommitted(SystemTarget, Result<GitCommitReply, String>),
     GitDismissBanner,
     WindowFocused,
+    OpenAi,
+    AiBack,
+    AiRestart,
+    /// The agent sent something; it waits in `Ai::mailbox`. Tagged with the
+    /// session it belongs to.
+    AiWake(u64),
+    AiInput(text_editor::Action),
+    AiSend,
+    AiAsk(String),
+    AiCancel,
+    AiAnswer(u64, Option<String>),
+    AiMode(String),
 }
 
 fn status_text(status: nix_backend_client::Status) -> String {
@@ -321,10 +343,12 @@ impl App {
             config_dir: from_env("NIX_BACKEND_CONFIG_DIR", &saved.config_dir),
             host_name: from_env("NIX_BACKEND_HOST_NAME", &saved.host_name),
             editor: saved.editor.clone(),
+            agent: saved.agent.clone(),
             page: Page::Dashboard,
             draft_config_dir: String::new(),
             draft_host_name: String::new(),
             draft_editor: String::new(),
+            draft_agent: String::new(),
             default_config_dir: None,
             default_host_name: None,
             saved,
@@ -342,6 +366,7 @@ impl App {
             copied: None,
             store: Store::new(),
             git: Git::new(),
+            ai: Ai::new(),
             fx: Fx::new(),
             last_frame: None,
         };
@@ -349,6 +374,7 @@ impl App {
         app.draft_config_dir = app.config_dir.clone();
         app.draft_host_name = app.host_name.clone();
         app.draft_editor = app.editor.clone();
+        app.draft_agent = app.agent.clone();
         (app, connect())
     }
 
@@ -381,17 +407,27 @@ impl App {
         }
     }
 
+    /// The agent command that will be used: what was typed, else the default.
+    pub fn effective_agent(&self) -> &str {
+        match self.agent.trim() {
+            "" => settings::DEFAULT_AGENT,
+            typed => typed,
+        }
+    }
+
     /// Whether the settings page has edits that aren't applied yet.
     pub fn settings_dirty(&self) -> bool {
         self.draft_config_dir.trim() != self.config_dir.trim()
             || self.draft_host_name.trim() != self.host_name.trim()
             || self.draft_editor.trim() != self.editor.trim()
+            || self.draft_agent.trim() != self.agent.trim()
     }
 
     fn revert_draft(&mut self) {
         self.draft_config_dir = self.config_dir.clone();
         self.draft_host_name = self.host_name.clone();
         self.draft_editor = self.editor.clone();
+        self.draft_agent = self.agent.clone();
     }
 
     /// Switches page and plays the entrance of the new content.
@@ -441,8 +477,13 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
-        self.fx
-            .set_looping(self.busy() || self.store.busy() || self.git.busy() || matches!(self.conn, Conn::Connecting));
+        self.fx.set_looping(
+            self.busy()
+                || self.store.busy()
+                || self.git.busy()
+                || self.ai.working()
+                || matches!(self.conn, Conn::Connecting),
+        );
         if !self.fx.animating() {
             // Frames stop arriving once nothing moves; don't let the gap count
             // as one huge step when they resume.
@@ -539,6 +580,10 @@ impl App {
                 self.draft_editor = value;
                 Task::none()
             }
+            Message::DraftAgentChanged(value) => {
+                self.draft_agent = value;
+                Task::none()
+            }
             Message::OpenConfig => {
                 self.notice = open_in_editor(self.effective_editor(), self.effective_config_dir()).err();
                 Task::none()
@@ -551,17 +596,20 @@ impl App {
                 self.draft_config_dir.clear();
                 self.draft_host_name.clear();
                 self.draft_editor.clear();
+                self.draft_agent.clear();
                 Task::none()
             }
             Message::ApplySettings => {
                 if !self.settings_dirty() {
                     return Task::none();
                 }
-                let (dir, host, editor) = (
+                let (dir, host, editor, agent) = (
                     self.draft_config_dir.trim().to_owned(),
                     self.draft_host_name.trim().to_owned(),
                     self.draft_editor.trim().to_owned(),
+                    self.draft_agent.trim().to_owned(),
                 );
+                let agent_changed = agent != self.agent.trim();
                 let target_changed = dir != self.config_dir.trim() || host != self.host_name.trim();
                 // Only fields the user changed are persisted, so a value that
                 // merely came from the environment doesn't get saved with them.
@@ -572,9 +620,15 @@ impl App {
                     self.saved.host_name = host.clone();
                 }
                 self.saved.editor = editor.clone();
+                self.saved.agent = agent.clone();
                 self.config_dir = dir;
                 self.host_name = host;
                 self.editor = editor;
+                self.agent = agent;
+                // A conversation belongs to the agent and the configuration it started with.
+                if target_changed || agent_changed {
+                    self.ai.stop();
+                }
                 self.notice = None;
                 self.persist();
                 if !target_changed {
@@ -648,6 +702,7 @@ impl App {
                         .map(|package| package.source_path.clone())
                         .unwrap_or_default(),
                     CopyTarget::Diff => self.git.diff.ready().map(|diff| diff.raw.clone()).unwrap_or_default(),
+                    CopyTarget::AiAnswer(index) => self.ai.answer_text(index).unwrap_or_default().to_owned(),
                     CopyTarget::Snippet(kind) => {
                         store::snippet(kind, &self.store.destination, self.effective_host_name())
                     }
@@ -1030,6 +1085,51 @@ impl App {
                 self.git.banner = None;
                 Task::none()
             }
+            Message::OpenAi => {
+                self.show(Page::Ai);
+                if matches!(self.ai.phase, ai::Phase::Idle) {
+                    self.start_ai()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::AiBack => {
+                self.show(Page::Dashboard);
+                Task::none()
+            }
+            Message::AiRestart => self.start_ai(),
+            Message::AiWake(session) => {
+                if session == self.ai.session {
+                    for event in self.ai.mailbox.take() {
+                        self.ai.apply(event);
+                    }
+                }
+                Task::none()
+            }
+            Message::AiInput(action) => {
+                self.ai.input.perform(action);
+                Task::none()
+            }
+            Message::AiSend => {
+                self.ai.ask(None);
+                Task::none()
+            }
+            Message::AiAsk(question) => {
+                self.ai.ask(Some(question));
+                Task::none()
+            }
+            Message::AiCancel => {
+                self.ai.cancel();
+                Task::none()
+            }
+            Message::AiAnswer(permission, option) => {
+                self.ai.answer(permission, option);
+                Task::none()
+            }
+            Message::AiMode(mode) => {
+                self.ai.set_mode(mode);
+                Task::none()
+            }
         }
     }
 
@@ -1038,6 +1138,26 @@ impl App {
         if let Some(run) = &self.run {
             sync_log(&mut self.log_view, &mut self.log_pending, self.log_hovered, &run.log);
         }
+    }
+
+    /// Starts the agent, ending any conversation there was. What it sends
+    /// waits in the mailbox, and the UI is woken when that goes from empty to not.
+    fn start_ai(&mut self) -> Task<Message> {
+        let config = match ai::config(self) {
+            Ok(config) => config,
+            Err(reason) => {
+                self.ai.stop();
+                self.ai.fail(reason);
+                return Task::none();
+            }
+        };
+        let (handle, events) = nix_agent_client::start(config);
+        let (session, mailbox) = self.ai.begin(handle);
+        Task::stream(
+            events.filter_map(move |event| {
+                futures::future::ready(mailbox.push(event).then_some(Message::AiWake(session)))
+            }),
+        )
     }
 
     fn load_git(&mut self) -> Task<Message> {

@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 /// The editor that opens the configuration unless another is set.
 pub const DEFAULT_EDITOR: &str = "zed";
 
+/// The AI agent that is started unless another is set. It must speak the
+/// Agent Client Protocol on its standard input and output.
+pub const DEFAULT_AGENT: &str = "claude-code-acp";
+
 /// Empty strings mean "use the default".
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -22,6 +26,10 @@ pub struct Settings {
     /// is passed to it as the last argument.
     #[serde(default)]
     pub editor: String,
+    /// A command line that starts an Agent Client Protocol agent, e.g.
+    /// `claude-code-acp` or `gemini --experimental-acp`.
+    #[serde(default)]
+    pub agent: String,
 }
 
 /// Splits a command line into words. Whitespace separates words; single or
@@ -118,6 +126,7 @@ mod tests {
             config_dir: "/home/me/nixos".to_owned(),
             host_name: "laptop".to_owned(),
             editor: "code --new-window".to_owned(),
+            agent: "gemini --experimental-acp".to_owned(),
         };
 
         settings.save_to(&path).unwrap();
