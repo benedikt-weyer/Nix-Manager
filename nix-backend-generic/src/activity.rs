@@ -9,15 +9,20 @@ use crate::proto::{BuildItem, BuildItemKind, BuildItemStatus, BuildStats};
 // they've been unchanged across the 2.1x series and are confirmed empirically
 // against the `nix` binary this daemon shells out to - see the git history
 // of this file for how that was verified.
+const ACT_COPY_PATH: i64 = 100;
 const ACT_FILE_TRANSFER: i64 = 101;
 const ACT_REALISE: i64 = 102;
 const ACT_COPY_PATHS: i64 = 103;
 const ACT_BUILDS: i64 = 104;
 const ACT_BUILD: i64 = 105;
+const ACT_SUBSTITUTE: i64 = 108;
 
 const RESULT_BUILD_LOG_LINE: i64 = 101;
 const RESULT_PROGRESS: i64 = 105;
 const RESULT_SET_EXPECTED: i64 = 106;
+
+// How far up the parent chain to look for the store path a download belongs to.
+const MAX_PARENT_DEPTH: usize = 8;
 
 // Only recently-finished builds/downloads are kept, so the snapshot stays
 // small during a big rebuild instead of accumulating every path ever seen.
@@ -110,6 +115,10 @@ fn display_name(raw: &str) -> String {
 #[derive(Default)]
 pub struct ActivityTracker {
     activities: std::collections::HashMap<i64, TrackedActivity>,
+    /// Activities that name a store path (copying or substituting it): id ->
+    /// (parent id, name). A download only knows the URL of a `<hash>.nar.zst`,
+    /// whose hash isn't the store path's, so it takes its name from these.
+    path_labels: std::collections::HashMap<i64, (i64, String)>,
     finished_order: Vec<i64>,
     stats: BuildStats,
     downloaded_bytes_total: f64,
@@ -153,10 +162,21 @@ impl ActivityTracker {
         let ty = value.get("type").and_then(Value::as_i64).unwrap_or(-1);
         let fields = value.get("fields").and_then(Value::as_array);
         let first_field = fields.and_then(|f| f.first()).and_then(Value::as_str);
+        let parent = value.get("parent").and_then(Value::as_i64).unwrap_or(0);
+
+        if matches!(ty, ACT_COPY_PATH | ACT_SUBSTITUTE) {
+            if let Some(path) = first_field {
+                self.path_labels.insert(id, (parent, display_name(path)));
+            }
+            return;
+        }
 
         let tracked = match ty {
             ACT_BUILD => TrackedActivity::new(TrackedKind::Build, display_name(first_field.unwrap_or_default())),
-            ACT_FILE_TRANSFER => TrackedActivity::new(TrackedKind::Download, display_name(first_field.unwrap_or_default())),
+            ACT_FILE_TRANSFER => {
+                let name = self.path_name(parent).unwrap_or_else(|| display_name(first_field.unwrap_or_default()));
+                TrackedActivity::new(TrackedKind::Download, name)
+            }
             ACT_BUILDS => TrackedActivity::new(TrackedKind::BuildsContainer, String::new()),
             ACT_COPY_PATHS => TrackedActivity::new(TrackedKind::CopiesContainer, String::new()),
             ACT_REALISE => TrackedActivity::new(TrackedKind::Realise, String::new()),
@@ -165,8 +185,21 @@ impl ActivityTracker {
         self.activities.insert(id, tracked);
     }
 
+    /// The store path name of the nearest ancestor that has one.
+    fn path_name(&self, mut id: i64) -> Option<String> {
+        for _ in 0..MAX_PARENT_DEPTH {
+            let (parent, name) = self.path_labels.get(&id)?;
+            if !name.is_empty() {
+                return Some(name.clone());
+            }
+            id = *parent;
+        }
+        None
+    }
+
     fn handle_stop(&mut self, value: &Value) {
         let Some(id) = value.get("id").and_then(Value::as_i64) else { return };
+        self.path_labels.remove(&id);
         let Some(act) = self.activities.get_mut(&id) else { return };
 
         match act.kind {
@@ -295,6 +328,28 @@ pub fn fraction_done(stats: &BuildStats) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_download_is_named_after_the_store_path_it_fetches() {
+        let mut tracker = ActivityTracker::new();
+        tracker.handle_json(&json!({"action": "start", "id": 1, "type": 108, "parent": 0,
+            "fields": ["/nix/store/pkkjnyk4z46n18fkyqwlg24p272apb69-xgcc-16.2.0-libgcc", "https://cache.nixos.org"]}));
+        tracker.handle_json(&json!({"action": "start", "id": 2, "type": 100, "parent": 1,
+            "fields": ["/nix/store/pkkjnyk4z46n18fkyqwlg24p272apb69-xgcc-16.2.0-libgcc", "https://cache.nixos.org"]}));
+        tracker.handle_json(&json!({"action": "start", "id": 3, "type": 101, "parent": 2,
+            "fields": ["https://cache.nixos.org/nar/0h7gafdl8j4y8aqc4d84yb8fjjfcwvwrcf8wnpy55yww7fhfndc5.nar.zst"]}));
+        // No known ancestor: the URL's file name is all there is.
+        tracker.handle_json(&json!({"action": "start", "id": 4, "type": 101, "parent": 99,
+            "fields": ["https://cache.nixos.org/nar/abc.nar.zst"]}));
+
+        let (items, _) = tracker.snapshot();
+        let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["xgcc-16.2.0-libgcc", "abc.nar.zst"]);
+
+        tracker.handle_json(&json!({"action": "stop", "id": 2}));
+        assert!(!tracker.path_labels.contains_key(&2));
+    }
 
     #[test]
     fn download_bytes_move_the_fraction_before_any_copy_finishes() {
