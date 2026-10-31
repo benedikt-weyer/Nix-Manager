@@ -354,7 +354,8 @@ fn settings(app: &App) -> Element<'_, Message> {
     let has_values = !app.draft_config_dir.trim().is_empty()
         || !app.draft_host_name.trim().is_empty()
         || !app.draft_editor.trim().is_empty()
-        || !app.draft_agent.trim().is_empty();
+        || !app.draft_agent.trim().is_empty()
+        || !app.draft_nix_options.trim().is_empty();
 
     container(
         column![
@@ -399,6 +400,16 @@ fn settings(app: &App) -> Element<'_, Message> {
                 Message::DraftAgentChanged
             ),
             text("Any agent that speaks the Agent Client Protocol, such as claude-code-acp, codex-acp or `gemini --experimental-acp`. It runs as you, in the config directory.")
+                .size(12)
+                .color(MUTED),
+            field(
+                lucide::hammer(),
+                "Nix build options",
+                nix_backend_client::settings::DEFAULT_NIX_OPTIONS,
+                &app.draft_nix_options,
+                Message::DraftNixOptionsChanged
+            ),
+            text("Extra arguments for `nix build` when rebuilding. The default retries failed cache downloads and drops stalled ones, which helps on an unreliable connection.")
                 .size(12)
                 .color(MUTED),
             row![

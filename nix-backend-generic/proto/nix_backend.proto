@@ -96,6 +96,9 @@ message UpdateFlakeRequest {
 message RebuildRequest {
     SystemTarget target = 1;
     RebuildMode mode = 2;
+    // Extra arguments for `nix build`, e.g. ["--option", "download-attempts",
+    // "10"]; how the download behaves on a flaky connection.
+    repeated string nix_args = 3;
 }
 
 message FlakeStatusRequest {

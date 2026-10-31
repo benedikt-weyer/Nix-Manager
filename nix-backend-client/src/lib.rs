@@ -225,8 +225,9 @@ impl Client {
         &mut self,
         target: SystemTarget,
         mode: RebuildMode,
+        nix_args: Vec<String>,
     ) -> Result<Streaming<ProgressEvent>, Status> {
-        let reply = self.inner.rebuild(RebuildRequest { target: Some(target), mode: mode as i32 }).await?;
+        let reply = self.inner.rebuild(RebuildRequest { target: Some(target), mode: mode as i32, nix_args }).await?;
         Ok(reply.into_inner())
     }
 }

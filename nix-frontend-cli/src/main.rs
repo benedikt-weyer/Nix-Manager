@@ -44,6 +44,9 @@ enum Command {
         /// How to activate: switch now, on next boot, test (not persistent), or just build
         #[arg(value_enum, default_value = "switch")]
         mode: Mode,
+        /// Extra arguments for `nix build`, after `--` [default: the nix options saved in the GUI's settings]
+        #[arg(last = true)]
+        nix_args: Vec<String>,
     },
     /// Follow the running (or next) operation, e.g. one started from a GUI; exits when it ends
     Watch,
@@ -122,8 +125,13 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
             let stream = client.update_flake(target).await.map_err(|s| s.message().to_owned())?;
             follow(stream, &mut printer).await
         }
-        Command::Rebuild { mode } => {
-            let stream = client.rebuild(target, mode.into()).await.map_err(|s| s.message().to_owned())?;
+        Command::Rebuild { mode, nix_args } => {
+            let nix_args = if nix_args.is_empty() {
+                nix_backend_client::settings::nix_args(&nix_backend_client::settings::Settings::load().nix_options)
+            } else {
+                nix_args
+            };
+            let stream = client.rebuild(target, mode.into(), nix_args).await.map_err(|s| s.message().to_owned())?;
             follow(stream, &mut printer).await
         }
         Command::Watch => {

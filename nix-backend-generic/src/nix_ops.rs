@@ -211,7 +211,7 @@ fn no_new_privs() -> bool {
         .unwrap_or(false)
 }
 
-pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, tx: EventTx) {
+pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[String], tx: EventTx) {
     let action = mode_label(mode);
     send(&tx, EventPhase::Started, format!("Rebuilding '{}' ({action})", target.host_name), false).await;
 
@@ -234,14 +234,10 @@ pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, tx: EventTx) {
         target.config_dir, target.host_name
     );
 
-    if let Err(e) = run_streamed(
-        "nix",
-        &["build", &flake_attr, "--out-link", &out_link, "--log-format", "internal-json", "-v"],
-        EventPhase::Build,
-        &tx,
-    )
-    .await
-    {
+    let mut build_args = vec!["build", &flake_attr, "--out-link", &out_link, "--log-format", "internal-json", "-v"];
+    build_args.extend(nix_args.iter().map(String::as_str));
+
+    if let Err(e) = run_streamed("nix", &build_args, EventPhase::Build, &tx).await {
         send(&tx, EventPhase::Failed, format!("Build failed: {e}"), true).await;
         return;
     }

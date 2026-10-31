@@ -130,7 +130,7 @@ impl NixBackend for Service {
         let (out_tx, out_rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
-            nix_ops::rebuild(&target, mode, tx).await;
+            nix_ops::rebuild(&target, mode, &req.nix_args, tx).await;
         });
         tokio::spawn(pump(self.hub.clone(), OperationKind::Rebuild, mode, rx, out_tx));
 

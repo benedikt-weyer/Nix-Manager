@@ -176,6 +176,8 @@ pub struct App {
     pub editor: String,
     /// The command that starts the AI agent; empty means the default.
     pub agent: String,
+    /// The extra `nix build` arguments for rebuilds; empty means the default.
+    pub nix_options: String,
     pub page: Page,
     /// What the settings page inputs currently say; becomes the applied
     /// target on Apply.
@@ -183,6 +185,7 @@ pub struct App {
     pub draft_host_name: String,
     pub draft_editor: String,
     pub draft_agent: String,
+    pub draft_nix_options: String,
     /// What the backend falls back to when a field is empty, once it has said.
     pub default_config_dir: Option<String>,
     pub default_host_name: Option<String>,
@@ -228,6 +231,7 @@ pub enum Message {
     DraftHostNameChanged(String),
     DraftEditorChanged(String),
     DraftAgentChanged(String),
+    DraftNixOptionsChanged(String),
     OpenConfig,
     ApplySettings,
     RevertDraft,
@@ -344,11 +348,13 @@ impl App {
             host_name: from_env("NIX_BACKEND_HOST_NAME", &saved.host_name),
             editor: saved.editor.clone(),
             agent: saved.agent.clone(),
+            nix_options: saved.nix_options.clone(),
             page: Page::Dashboard,
             draft_config_dir: String::new(),
             draft_host_name: String::new(),
             draft_editor: String::new(),
             draft_agent: String::new(),
+            draft_nix_options: String::new(),
             default_config_dir: None,
             default_host_name: None,
             saved,
@@ -375,6 +381,7 @@ impl App {
         app.draft_host_name = app.host_name.clone();
         app.draft_editor = app.editor.clone();
         app.draft_agent = app.agent.clone();
+        app.draft_nix_options = app.nix_options.clone();
         (app, connect())
     }
 
@@ -421,6 +428,7 @@ impl App {
             || self.draft_host_name.trim() != self.host_name.trim()
             || self.draft_editor.trim() != self.editor.trim()
             || self.draft_agent.trim() != self.agent.trim()
+            || self.draft_nix_options.trim() != self.nix_options.trim()
     }
 
     fn revert_draft(&mut self) {
@@ -428,6 +436,7 @@ impl App {
         self.draft_host_name = self.host_name.clone();
         self.draft_editor = self.editor.clone();
         self.draft_agent = self.agent.clone();
+        self.draft_nix_options = self.nix_options.clone();
     }
 
     /// Switches page and plays the entrance of the new content.
@@ -584,6 +593,10 @@ impl App {
                 self.draft_agent = value;
                 Task::none()
             }
+            Message::DraftNixOptionsChanged(value) => {
+                self.draft_nix_options = value;
+                Task::none()
+            }
             Message::OpenConfig => {
                 self.notice = open_in_editor(self.effective_editor(), self.effective_config_dir()).err();
                 Task::none()
@@ -597,17 +610,19 @@ impl App {
                 self.draft_host_name.clear();
                 self.draft_editor.clear();
                 self.draft_agent.clear();
+                self.draft_nix_options.clear();
                 Task::none()
             }
             Message::ApplySettings => {
                 if !self.settings_dirty() {
                     return Task::none();
                 }
-                let (dir, host, editor, agent) = (
+                let (dir, host, editor, agent, nix_options) = (
                     self.draft_config_dir.trim().to_owned(),
                     self.draft_host_name.trim().to_owned(),
                     self.draft_editor.trim().to_owned(),
                     self.draft_agent.trim().to_owned(),
+                    self.draft_nix_options.trim().to_owned(),
                 );
                 let agent_changed = agent != self.agent.trim();
                 let target_changed = dir != self.config_dir.trim() || host != self.host_name.trim();
@@ -621,10 +636,12 @@ impl App {
                 }
                 self.saved.editor = editor.clone();
                 self.saved.agent = agent.clone();
+                self.saved.nix_options = nix_options.clone();
                 self.config_dir = dir;
                 self.host_name = host;
                 self.editor = editor;
                 self.agent = agent;
+                self.nix_options = nix_options;
                 // A conversation belongs to the agent and the configuration it started with.
                 if target_changed || agent_changed {
                     self.ai.stop();
@@ -646,6 +663,7 @@ impl App {
                 };
                 self.notice = None;
                 let target = self.target();
+                let nix_args = settings::nix_args(&self.nix_options);
                 // The progress comes back through `Watch`; the stream returned
                 // here is only dropped. Its only use is the rejection when
                 // another instance already has an operation running.
@@ -653,7 +671,7 @@ impl App {
                     async move {
                         match action {
                             Action::Update => client.update_flake(target).await.map(drop),
-                            Action::Rebuild(mode) => client.rebuild(target, mode).await.map(drop),
+                            Action::Rebuild(mode) => client.rebuild(target, mode, nix_args).await.map(drop),
                         }
                         .map_err(status_text)
                     },

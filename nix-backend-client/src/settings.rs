@@ -15,6 +15,13 @@ pub const DEFAULT_EDITOR: &str = "zed";
 /// Agent Client Protocol on its standard input and output.
 pub const DEFAULT_AGENT: &str = "claude-code-acp";
 
+/// Arguments for `nix build` unless others are set. They make a rebuild
+/// survive a flaky connection to the binary cache: fewer parallel downloads,
+/// more retries, and a stalled download is dropped and retried instead of
+/// hanging.
+pub const DEFAULT_NIX_OPTIONS: &str = "--option http-connections 5 --option download-attempts 10 \
+     --option connect-timeout 10 --option stalled-download-timeout 60";
+
 /// Empty strings mean "use the default".
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
@@ -30,6 +37,9 @@ pub struct Settings {
     /// `claude-code-acp` or `gemini --experimental-acp`.
     #[serde(default)]
     pub agent: String,
+    /// Extra arguments for `nix build` when rebuilding, as a command line.
+    #[serde(default)]
+    pub nix_options: String,
 }
 
 /// Splits a command line into words. Whitespace separates words; single or
@@ -72,6 +82,11 @@ pub fn split_command(line: &str) -> Vec<String> {
         words.push(word);
     }
     words
+}
+
+/// The `nix build` arguments for a typed command line: the default when empty.
+pub fn nix_args(typed: &str) -> Vec<String> {
+    split_command(if typed.trim().is_empty() { DEFAULT_NIX_OPTIONS } else { typed })
 }
 
 impl Settings {
@@ -127,6 +142,7 @@ mod tests {
             host_name: "laptop".to_owned(),
             editor: "code --new-window".to_owned(),
             agent: "gemini --experimental-acp".to_owned(),
+            nix_options: "--option download-attempts 3".to_owned(),
         };
 
         settings.save_to(&path).unwrap();
@@ -144,6 +160,13 @@ mod tests {
         assert_eq!(split_command(r#"echo "say \"hi\"""#), ["echo", r#"say "hi""#]);
         assert_eq!(split_command(r#"x "" y"#), ["x", "", "y"]);
         assert!(split_command("   ").is_empty());
+    }
+
+    #[test]
+    fn empty_nix_options_use_the_default() {
+        assert_eq!(nix_args("  "), split_command(DEFAULT_NIX_OPTIONS));
+        assert_eq!(nix_args("--keep-going"), ["--keep-going"]);
+        assert!(nix_args("").windows(3).any(|w| w == ["--option", "download-attempts", "10"]));
     }
 
     #[test]
