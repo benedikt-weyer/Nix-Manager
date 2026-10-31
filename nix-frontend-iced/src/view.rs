@@ -599,7 +599,16 @@ fn activity<'a>(app: &'a App, run: &'a Run) -> Element<'a, Message> {
         .width(Length::Fill),
         status,
         if run.running() {
-            Element::from(space::horizontal().width(0))
+            // Past this point the system is being changed and can't be left half-switched.
+            if matches!(run.phase, EventPhase::Register | EventPhase::Activate) {
+                Element::from(space::horizontal().width(0))
+            } else {
+                button(row![lucide::square().size(13), text("Cancel").size(13)].spacing(6).align_y(Alignment::Center))
+                    .padding([6, 12])
+                    .style(ghost_button)
+                    .on_press(Message::CancelOperation)
+                    .into()
+            }
         } else {
             button(row![lucide::x().size(13), text("Dismiss").size(13)].spacing(6).align_y(Alignment::Center))
                 .padding([6, 12])

@@ -19,6 +19,13 @@ service NixBackend {
     // activates under one, BUILD_ONLY needs none.
     rpc Rebuild(RebuildRequest) returns (stream ProgressEvent);
 
+    // Stops the running operation: kills a running nix, the build included
+    // when it runs as root. Fails with FAILED_PRECONDITION when nothing is
+    // running, or when the operation has reached registering and activating
+    // the system, which must not be interrupted halfway. The operation's
+    // stream then ends with a FAILED event whose message is "Cancelled".
+    rpc CancelOperation(CancelOperationRequest) returns (CancelOperationReply);
+
     // Reports when the flake was last changed, from git history.
     rpc GetFlakeStatus(FlakeStatusRequest) returns (FlakeStatusReply);
 
@@ -196,6 +203,10 @@ message ProgressEvent {
 }
 
 message WatchRequest {}
+
+message CancelOperationRequest {}
+
+message CancelOperationReply {}
 
 enum OperationKind {
     OPERATION_KIND_UNSPECIFIED = 0;

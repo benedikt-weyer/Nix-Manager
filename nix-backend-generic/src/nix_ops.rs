@@ -1,16 +1,61 @@
 use std::process::Stdio;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tonic::Status;
 
 use crate::activity::{self, ActivityTracker};
 use crate::config::ResolvedTarget;
 use crate::proto::{EventPhase, FlakeStatusReply, ProgressEvent, RebuildMode};
+
+/// Lets a running operation be stopped from outside, up to the point where
+/// stopping would leave the system half-switched.
+pub struct Cancel {
+    requested: watch::Sender<bool>,
+    locked: AtomicBool,
+}
+
+impl Cancel {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { requested: watch::channel(false).0, locked: AtomicBool::new(false) })
+    }
+
+    pub fn request(&self) -> Result<(), &'static str> {
+        if self.locked.load(Ordering::SeqCst) {
+            return Err("registering and activating the system can't be cancelled");
+        }
+        self.requested.send_replace(true);
+        Ok(())
+    }
+
+    /// The point of no return: from here on, requests are refused. Returns
+    /// whether one had already come in, in which case the caller must stop.
+    fn lock(&self) -> bool {
+        self.locked.store(true, Ordering::SeqCst);
+        *self.requested.borrow()
+    }
+}
+
+/// What a command run with a [`Cancel`] fails with when it was stopped.
+#[derive(Debug)]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+async fn send_cancelled(tx: &EventTx) {
+    send(tx, EventPhase::Failed, "Cancelled", true).await;
+}
 
 pub type EventTx = Sender<Result<ProgressEvent, Status>>;
 
@@ -102,27 +147,48 @@ fn find_in_path(name: &str) -> Option<String> {
     std::env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file()).map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Runs a command (see [`run_core`]) that `cancel` can stop, failing with [`Cancelled`].
+async fn run_cancellable(
+    program: &str,
+    args: &[&str],
+    phase: EventPhase,
+    tx: &EventTx,
+    cancel: &Cancel,
+) -> anyhow::Result<()> {
+    run_core(program, args, Arc::new(AtomicI32::new(phase as i32)), tx, Some(cancel)).await
+}
+
+/// Like [`run_cancellable`], but the phase can change mid-run (see
+/// [`PHASE_MARKER`]); `phase` holds the current one, so the caller can tell
+/// afterwards which step a failure happened in.
+async fn run_phased(program: &str, args: &[&str], phase: Arc<AtomicI32>, tx: &EventTx) -> anyhow::Result<()> {
+    run_core(program, args, phase, tx, None).await
+}
+
 /// Runs a command to completion, streaming every stdout/stderr line as a
 /// `ProgressEvent` tagged with `phase` as it's produced (not buffered until
 /// exit) so the UI's log view fills in live. Also feeds every line through a
 /// fresh `ActivityTracker`, so each `ProgressEvent` carries a current
 /// snapshot of what nix is actually building/downloading right now.
-async fn run_streamed(program: &str, args: &[&str], phase: EventPhase, tx: &EventTx) -> anyhow::Result<()> {
-    run_phased(program, args, Arc::new(AtomicI32::new(phase as i32)), tx).await
-}
-
-/// Like [`run_streamed`], but the phase can change mid-run (see
-/// [`PHASE_MARKER`]); `phase` holds the current one, so the caller can tell
-/// afterwards which step a failure happened in.
-async fn run_phased(program: &str, args: &[&str], phase: Arc<AtomicI32>, tx: &EventTx) -> anyhow::Result<()> {
+/// With a `cancel`, the command is stopped when it is requested.
+async fn run_core(
+    program: &str,
+    args: &[&str],
+    phase: Arc<AtomicI32>,
+    tx: &EventTx,
+    cancel: Option<&Cancel>,
+) -> anyhow::Result<()> {
     let mut child = Command::new(program)
         .args(args)
-        .stdin(Stdio::null())
+        // Kept open while a cancellable command runs: closing it is how a
+        // root process, which we can't signal, is told to stop.
+        .stdin(if cancel.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to start {program}: {e}"))?;
 
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
 
@@ -152,9 +218,34 @@ async fn run_phased(program: &str, args: &[&str], phase: Arc<AtomicI32>, tx: &Ev
         }
     });
 
-    let status = child.wait().await?;
+    let mut cancelled = false;
+    let status = match cancel {
+        None => child.wait().await?,
+        Some(cancel) => {
+            let mut requested = cancel.requested.subscribe();
+            // The guard `wait_for` returns must not be held across an await.
+            let stop_requested = async {
+                let _ = requested.wait_for(|requested| *requested).await;
+            };
+            tokio::select! {
+                status = child.wait() => status?,
+                () = stop_requested => {
+                    cancelled = true;
+                    drop(stdin);
+                    // Refused for a root process, which the closed stdin has
+                    // already told to stop.
+                    let _ = child.start_kill();
+                    child.wait().await?
+                }
+            }
+        }
+    };
     let _ = out_task.await;
     let _ = err_task.await;
+
+    if cancelled {
+        return Err(Cancelled.into());
+    }
 
     if !status.success() {
         // Keep the message readable when an argument is a whole script.
@@ -184,19 +275,21 @@ fn out_link_path() -> String {
     format!("{dir}/result-{}-{nanos}", std::process::id())
 }
 
-pub async fn update_flake(target: &ResolvedTarget, tx: EventTx) {
+pub async fn update_flake(target: &ResolvedTarget, cancel: &Cancel, tx: EventTx) {
     send(&tx, EventPhase::Started, format!("Updating flake inputs in {}", target.config_dir), false).await;
 
-    let result = run_streamed(
+    let result = run_cancellable(
         "nix",
         &["flake", "update", "--flake", &target.config_dir, "--log-format", "internal-json", "-v"],
         EventPhase::FlakeUpdate,
         &tx,
+        cancel,
     )
     .await;
 
     match result {
         Ok(()) => send(&tx, EventPhase::Finished, "Flake inputs updated", false).await,
+        Err(e) if e.is::<Cancelled>() => send_cancelled(&tx).await,
         Err(e) => send(&tx, EventPhase::Failed, format!("Flake update failed: {e}"), true).await,
     }
 }
@@ -217,13 +310,29 @@ fn no_new_privs() -> bool {
 const FORWARDED_ENV: &[&str] =
     &["PATH", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"];
 
+/// Runs "$@" as root and terminates it once stdin is closed. A process that
+/// pkexec started belongs to root, so the user can't signal it; the pipe is
+/// the one channel left to tell it to stop. Closing stdin also stops it when
+/// the backend itself goes away.
+const ROOT_UNTIL_STDIN_CLOSES: &str = r#"exec 3<&0
+"$@" &
+child=$!
+{ cat <&3 >/dev/null; kill -TERM "$child" 2>/dev/null; } &
+watcher=$!
+wait "$child"
+status=$?
+kill "$watcher" 2>/dev/null
+exit "$status"
+"#;
+
 /// The command that runs `nix <nix_args>` as root through `pkexec`. The nix
 /// daemon only honors settings such as `download-attempts` and
 /// `http-connections` from trusted users, and root is one. The flake belongs
 /// to the user, so git is told to trust its directory instead of refusing it
 /// as owned by someone else.
 fn elevated_nix(config_dir: &str, nix_args: Vec<String>) -> (&'static str, Vec<String>) {
-    let mut args = vec![find_in_path("env").unwrap_or_else(|| "env".to_owned())];
+    let mut args = ["sh", "-c", ROOT_UNTIL_STDIN_CLOSES, "sh"].map(str::to_owned).to_vec();
+    args.push(find_in_path("env").unwrap_or_else(|| "env".to_owned()));
     args.extend(FORWARDED_ENV.iter().filter_map(|name| std::env::var(name).ok().map(|value| format!("{name}={value}"))));
     args.extend(
         ["GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory"].map(str::to_owned),
@@ -234,7 +343,7 @@ fn elevated_nix(config_dir: &str, nix_args: Vec<String>) -> (&'static str, Vec<S
     ("pkexec", args)
 }
 
-pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[String], build_as_root: bool, tx: EventTx) {
+pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[String], build_as_root: bool, cancel: &Cancel, tx: EventTx) {
     let action = mode_label(mode);
     send(&tx, EventPhase::Started, format!("Rebuilding '{}' ({action})", target.host_name), false).await;
 
@@ -269,19 +378,30 @@ pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[Str
     };
     let build_args: Vec<&str> = build_args.iter().map(String::as_str).collect();
 
-    if let Err(e) = run_streamed(program, &build_args, EventPhase::Build, &tx).await {
+    if let Err(e) = run_cancellable(program, &build_args, EventPhase::Build, &tx, cancel).await {
+        let _ = tokio::fs::remove_file(&out_link).await;
+        if e.is::<Cancelled>() {
+            send_cancelled(&tx).await;
+            return;
+        }
         send(&tx, EventPhase::Failed, format!("Build failed: {e}"), true).await;
         return;
     }
 
-    if let Err(e) = run_streamed(
+    if let Err(e) = run_cancellable(
         "nix",
         &["store", "diff-closures", "/run/current-system", &out_link],
         EventPhase::Diff,
         &tx,
+        cancel,
     )
     .await
     {
+        if e.is::<Cancelled>() {
+            let _ = tokio::fs::remove_file(&out_link).await;
+            send_cancelled(&tx).await;
+            return;
+        }
         // Not fatal - the previous generation may not exist yet, or the
         // running system may not be a nix profile (e.g. a first install).
         // Still worth telling the user, but keep going.
@@ -302,6 +422,14 @@ pub async fn rebuild(target: &ResolvedTarget, mode: RebuildMode, nix_args: &[Str
         // so no privileged step beyond the optional root build.
         let _ = tokio::fs::remove_file(&out_link).await;
         send(&tx, EventPhase::Finished, format!("Build complete: {resolved}"), false).await;
+        return;
+    }
+
+    // From here on the system is changed, and stopping halfway would leave it
+    // half-switched.
+    if cancel.lock() {
+        let _ = tokio::fs::remove_file(&out_link).await;
+        send_cancelled(&tx).await;
         return;
     }
 

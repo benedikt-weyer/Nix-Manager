@@ -51,6 +51,8 @@ enum Command {
         #[arg(long)]
         no_root: bool,
     },
+    /// Stop the running update or build (not once it is activating the system)
+    Cancel,
     /// Follow the running (or next) operation, e.g. one started from a GUI; exits when it ends
     Watch,
     /// Print a shell completion script, e.g. `source <(nix-manager completions zsh)`
@@ -134,6 +136,11 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
             let build_as_root = settings.build_as_root() && !no_root;
             let stream = client.rebuild(target, mode.into(), nix_args, build_as_root).await.map_err(|s| s.message().to_owned())?;
             follow(stream, &mut printer).await
+        }
+        Command::Cancel => {
+            client.cancel_operation().await.map_err(|s| s.message().to_owned())?;
+            println!("Cancelling");
+            Ok(ExitCode::SUCCESS)
         }
         Command::Watch => {
             let mut stream = client.watch().await.map_err(|s| s.message().to_owned())?;

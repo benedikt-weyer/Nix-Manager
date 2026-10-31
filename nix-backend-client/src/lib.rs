@@ -30,7 +30,8 @@ pub use proto::{
 
 use proto::nix_backend_client::NixBackendClient;
 use proto::{
-    CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest, GitCommitRequest, GitDiffRequest,
+    CancelOperationRequest, CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest, GitCommitRequest,
+    GitDiffRequest,
     GitSetStagedRequest, GitStatusRequest, ListDestinationsRequest, ListInstalledRequest, RebuildRequest,
     SearchPackagesRequest, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
 };
@@ -219,6 +220,13 @@ impl Client {
     pub async fn update_flake(&mut self, target: SystemTarget) -> Result<Streaming<ProgressEvent>, Status> {
         let reply = self.inner.update_flake(UpdateFlakeRequest { target: Some(target) }).await?;
         Ok(reply.into_inner())
+    }
+
+    /// Stops the running operation. Fails with `FAILED_PRECONDITION` when
+    /// nothing is running or it has reached activation, which can't be stopped.
+    pub async fn cancel_operation(&mut self) -> Result<(), Status> {
+        self.inner.cancel_operation(CancelOperationRequest {}).await?;
+        Ok(())
     }
 
     pub async fn rebuild(

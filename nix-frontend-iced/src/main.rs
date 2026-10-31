@@ -235,6 +235,8 @@ pub enum Message {
     DraftAgentChanged(String),
     DraftNixOptionsChanged(String),
     SetBuildAsRoot(bool),
+    /// Stop the running operation.
+    CancelOperation,
     OpenConfig,
     ApplySettings,
     RevertDraft,
@@ -691,6 +693,17 @@ impl App {
                         Err(error) => Message::StartRejected(error),
                     },
                 )
+            }
+            Message::CancelOperation => {
+                let Some(mut client) = self.client() else {
+                    return Task::none();
+                };
+                // The operation ends through the `Watch` stream like any other;
+                // only a refusal (it can't be stopped any more) comes back here.
+                Task::perform(async move { client.cancel_operation().await.map_err(status_text) }, |result| match result {
+                    Ok(()) => Message::DismissNotice,
+                    Err(error) => Message::StartRejected(error),
+                })
             }
             Message::StartRejected(error) => {
                 self.notice = Some(error);

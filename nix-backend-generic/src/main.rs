@@ -20,9 +20,10 @@ use tokio_stream::wrappers::{BroadcastStream, ReceiverStream, UnixListenerStream
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
+use nix_ops::Cancel;
 use proto::nix_backend_server::{NixBackend, NixBackendServer};
 use proto::{
-    CreateDestinationRequest, Destination, FlakeStatusReply, FlakeStatusRequest, GetPackageRequest, GitCommitReply,
+    CancelOperationReply, CancelOperationRequest, CreateDestinationRequest, Destination, FlakeStatusReply, FlakeStatusRequest, GetPackageRequest, GitCommitReply,
     GitCommitRequest, GitDiffReply, GitDiffRequest, GitSetStagedRequest, GitStatusReply, GitStatusRequest,
     ListDestinationsReply, ListDestinationsRequest, ListInstalledReply, ListInstalledRequest, OperationEvent,
     OperationKind, Package, ProgressEvent, RebuildMode, RebuildRequest, SearchPackagesReply, SearchPackagesRequest,
@@ -37,22 +38,34 @@ type OperationStream = Pin<Box<dyn Stream<Item = Result<OperationEvent, Status>>
 /// running operation's events out to every `Watch` subscriber.
 struct Hub {
     running: Mutex<Option<OperationEvent>>,
+    cancel: Mutex<Option<Arc<Cancel>>>,
     events: broadcast::Sender<OperationEvent>,
 }
 
 impl Hub {
     fn new() -> Arc<Self> {
-        Arc::new(Self { running: Mutex::new(None), events: broadcast::channel(1024).0 })
+        Arc::new(Self { running: Mutex::new(None), cancel: Mutex::new(None), events: broadcast::channel(1024).0 })
     }
 
     /// Claims the single operation slot.
-    fn begin(&self, kind: OperationKind, mode: RebuildMode) -> Result<(), Status> {
+    fn begin(&self, kind: OperationKind, mode: RebuildMode) -> Result<Arc<Cancel>, Status> {
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err(Status::failed_precondition("another operation is already running"));
         }
         *running = Some(OperationEvent { kind: kind as i32, mode: mode as i32, event: None });
-        Ok(())
+        let cancel = Cancel::new();
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel.clone());
+        Ok(cancel)
+    }
+
+    /// Asks the running operation to stop.
+    fn cancel(&self) -> Result<(), Status> {
+        let cancel = self.cancel.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        cancel
+            .ok_or_else(|| Status::failed_precondition("nothing is running"))?
+            .request()
+            .map_err(Status::failed_precondition)
     }
 
     fn publish(&self, kind: OperationKind, mode: RebuildMode, event: &ProgressEvent) {
@@ -63,6 +76,7 @@ impl Hub {
     }
 
     fn end(&self) {
+        *self.cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
@@ -106,12 +120,12 @@ impl NixBackend for Service {
 
     async fn update_flake(&self, request: Request<UpdateFlakeRequest>) -> Result<Response<Self::UpdateFlakeStream>, Status> {
         let target = config::resolve(request.into_inner().target.as_ref());
-        self.hub.begin(OperationKind::UpdateFlake, RebuildMode::Unspecified)?;
+        let cancel = self.hub.begin(OperationKind::UpdateFlake, RebuildMode::Unspecified)?;
         let (tx, rx) = mpsc::channel(64);
         let (out_tx, out_rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
-            nix_ops::update_flake(&target, tx).await;
+            nix_ops::update_flake(&target, &cancel, tx).await;
         });
         tokio::spawn(pump(self.hub.clone(), OperationKind::UpdateFlake, RebuildMode::Unspecified, rx, out_tx));
 
@@ -125,16 +139,24 @@ impl NixBackend for Service {
         // fall back to a mode that activates the system.
         let mode = RebuildMode::try_from(req.mode)
             .map_err(|_| Status::invalid_argument(format!("unknown rebuild mode {}", req.mode)))?;
-        self.hub.begin(OperationKind::Rebuild, mode)?;
+        let cancel = self.hub.begin(OperationKind::Rebuild, mode)?;
         let (tx, rx) = mpsc::channel(64);
         let (out_tx, out_rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
-            nix_ops::rebuild(&target, mode, &req.nix_args, req.build_as_root, tx).await;
+            nix_ops::rebuild(&target, mode, &req.nix_args, req.build_as_root, &cancel, tx).await;
         });
         tokio::spawn(pump(self.hub.clone(), OperationKind::Rebuild, mode, rx, out_tx));
 
         Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+    }
+
+    async fn cancel_operation(
+        &self,
+        _request: Request<CancelOperationRequest>,
+    ) -> Result<Response<CancelOperationReply>, Status> {
+        self.hub.cancel()?;
+        Ok(Response::new(CancelOperationReply {}))
     }
 
     async fn watch(&self, _request: Request<WatchRequest>) -> Result<Response<Self::WatchStream>, Status> {
