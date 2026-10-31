@@ -20,17 +20,49 @@ pub mod proto {
     tonic::include_proto!("caelestia.nixbackend.v1");
 }
 
+pub mod diff;
+
 pub use proto::{
-    BuildItem, BuildItemKind, BuildItemStatus, BuildStats, Destination, EventPhase, FlakeStatusReply, Maintainer,
-    OperationEvent, OperationKind, Package, PackageSummary, ProgressEvent, RebuildMode, SearchPackagesReply,
-    SetConfigPackageReply, SystemTarget,
+    BuildItem, BuildItemKind, BuildItemStatus, BuildStats, Destination, EventPhase, FlakeStatusReply, GitChange,
+    GitCommitReply, GitDiffReply, GitFile, GitStatusReply, Maintainer, OperationEvent, OperationKind, Package,
+    PackageSummary, ProgressEvent, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
 };
 
 use proto::nix_backend_client::NixBackendClient;
 use proto::{
-    CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest, ListDestinationsRequest, ListInstalledRequest,
-    RebuildRequest, SearchPackagesRequest, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
+    CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest, GitCommitRequest, GitDiffRequest,
+    GitSetStagedRequest, GitStatusRequest, ListDestinationsRequest, ListInstalledRequest, RebuildRequest,
+    SearchPackagesRequest, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
 };
+
+impl GitFile {
+    /// What is staged for the next commit.
+    pub fn staged_change(&self) -> GitChange {
+        GitChange::try_from(self.staged).unwrap_or(GitChange::None)
+    }
+
+    /// What differs between the index and the working tree.
+    pub fn unstaged_change(&self) -> GitChange {
+        GitChange::try_from(self.unstaged).unwrap_or(GitChange::None)
+    }
+
+    pub fn is_staged(&self) -> bool {
+        self.staged_change() != GitChange::None
+    }
+
+    pub fn is_unstaged(&self) -> bool {
+        self.unstaged_change() != GitChange::None
+    }
+
+    /// The paths to hand to [`Client::git_set_staged`] to move this file. A
+    /// rename has two: staging or unstaging only the new name would leave the
+    /// old one behind as a deletion.
+    pub fn paths(&self) -> Vec<String> {
+        let mut paths = vec![self.path.clone()];
+        paths.extend((!self.old_path.is_empty()).then(|| self.old_path.clone()));
+        paths
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
@@ -134,6 +166,42 @@ impl Client {
     ) -> Result<SetConfigPackageReply, Status> {
         let request = SetConfigPackageRequest { target: Some(target), file, attr, present };
         Ok(self.inner.set_config_package(request).await?.into_inner())
+    }
+
+    /// The git repository the configuration lives in: branch and changed files.
+    /// `is_repo` is false when the directory isn't in one.
+    pub async fn git_status(&mut self, target: SystemTarget) -> Result<GitStatusReply, Status> {
+        Ok(self.inner.git_status(GitStatusRequest { target: Some(target) }).await?.into_inner())
+    }
+
+    /// Stages (`staged` true) or unstages `paths`, relative to the repository
+    /// root; empty means every file. Returns the status afterwards.
+    pub async fn git_set_staged(
+        &mut self,
+        target: SystemTarget,
+        paths: Vec<String>,
+        staged: bool,
+    ) -> Result<GitStatusReply, Status> {
+        let request = GitSetStagedRequest { target: Some(target), paths, staged };
+        Ok(self.inner.git_set_staged(request).await?.into_inner())
+    }
+
+    /// Commits what is staged.
+    pub async fn git_commit(&mut self, target: SystemTarget, message: String) -> Result<GitCommitReply, Status> {
+        let request = GitCommitRequest { target: Some(target), message };
+        Ok(self.inner.git_commit(request).await?.into_inner())
+    }
+
+    /// The unified diff of one file, staged or not. Parse it with [`diff::parse`].
+    pub async fn git_diff(
+        &mut self,
+        target: SystemTarget,
+        file: &GitFile,
+        staged: bool,
+    ) -> Result<GitDiffReply, Status> {
+        let request =
+            GitDiffRequest { target: Some(target), path: file.path.clone(), old_path: file.old_path.clone(), staged };
+        Ok(self.inner.git_diff(request).await?.into_inner())
     }
 
     /// Every event of every operation, whoever started it. Frontends should

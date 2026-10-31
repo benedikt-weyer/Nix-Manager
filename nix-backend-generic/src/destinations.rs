@@ -74,7 +74,7 @@ fn is_attr_path(attr: &str) -> bool {
         })
 }
 
-fn config_path(config_dir: &str) -> Result<PathBuf, Status> {
+pub(crate) fn config_path(config_dir: &str) -> Result<PathBuf, Status> {
     let dir = Path::new(config_dir.strip_prefix("path:").unwrap_or(config_dir));
     if dir.is_dir() {
         Ok(dir.to_owned())

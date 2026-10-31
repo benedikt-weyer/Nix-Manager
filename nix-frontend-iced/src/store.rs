@@ -677,16 +677,16 @@ fn tab_button<'a>(label: String, icon: Text<'a>, active: bool, tab: Tab) -> Elem
         .into()
 }
 
-fn card<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
+pub(crate) fn card<'a>(content: Element<'a, Message>) -> Element<'a, Message> {
     card_with(content, 8)
 }
 
-fn card_with<'a>(content: Element<'a, Message>, padding: u16) -> Element<'a, Message> {
+pub(crate) fn card_with<'a>(content: Element<'a, Message>, padding: u16) -> Element<'a, Message> {
     container(content).padding(padding).width(Length::Fill).style(theme::card).into()
 }
 
 /// A centred message for when there is nothing to list.
-fn notice<'a>(icon: Text<'a>, tint: Color, title: &str, detail: &str) -> Element<'a, Message> {
+pub(crate) fn notice<'a>(icon: Text<'a>, tint: Color, title: &str, detail: &str) -> Element<'a, Message> {
     card_with(
         row![
             centered_icon(icon, 22.0, tint),
@@ -700,7 +700,7 @@ fn notice<'a>(icon: Text<'a>, tint: Color, title: &str, detail: &str) -> Element
     )
 }
 
-fn failure<'a>(title: &str, error: &str) -> Element<'a, Message> {
+pub(crate) fn failure<'a>(title: &str, error: &str) -> Element<'a, Message> {
     card_with(
         row![
             lucide::circle_x().size(22).color(DANGER),
@@ -719,7 +719,7 @@ fn failure<'a>(title: &str, error: &str) -> Element<'a, Message> {
 }
 
 /// Something is on its way: say what, with a sweeping bar.
-fn working<'a>(fx: &crate::fx::Fx, title: String, detail: &str) -> Element<'a, Message> {
+pub(crate) fn working<'a>(fx: &crate::fx::Fx, title: String, detail: &str) -> Element<'a, Message> {
     card_with(
         column![
             text(title).size(15).font(BOLD),

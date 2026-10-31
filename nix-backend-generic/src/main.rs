@@ -1,6 +1,7 @@
 mod activity;
 mod config;
 mod destinations;
+mod git;
 mod nix_ops;
 mod store;
 
@@ -21,7 +22,8 @@ use tonic::{Request, Response, Status};
 
 use proto::nix_backend_server::{NixBackend, NixBackendServer};
 use proto::{
-    CreateDestinationRequest, Destination, FlakeStatusReply, FlakeStatusRequest, GetPackageRequest,
+    CreateDestinationRequest, Destination, FlakeStatusReply, FlakeStatusRequest, GetPackageRequest, GitCommitReply,
+    GitCommitRequest, GitDiffReply, GitDiffRequest, GitSetStagedRequest, GitStatusReply, GitStatusRequest,
     ListDestinationsReply, ListDestinationsRequest, ListInstalledReply, ListInstalledRequest, OperationEvent,
     OperationKind, Package, ProgressEvent, RebuildMode, RebuildRequest, SearchPackagesReply, SearchPackagesRequest,
     SetConfigPackageReply, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
@@ -196,6 +198,31 @@ impl NixBackend for Service {
         let target = config::resolve(req.target.as_ref());
         let reply =
             blocking(move || destinations::set_package(&target.config_dir, &req.file, &req.attr, req.present)).await?;
+        Ok(Response::new(reply))
+    }
+
+    async fn git_status(&self, request: Request<GitStatusRequest>) -> Result<Response<GitStatusReply>, Status> {
+        let target = config::resolve(request.into_inner().target.as_ref());
+        Ok(Response::new(blocking(move || git::status(&target.config_dir)).await?))
+    }
+
+    async fn git_set_staged(&self, request: Request<GitSetStagedRequest>) -> Result<Response<GitStatusReply>, Status> {
+        let req = request.into_inner();
+        let target = config::resolve(req.target.as_ref());
+        let reply = blocking(move || git::set_staged(&target.config_dir, &req.paths, req.staged)).await?;
+        Ok(Response::new(reply))
+    }
+
+    async fn git_commit(&self, request: Request<GitCommitRequest>) -> Result<Response<GitCommitReply>, Status> {
+        let req = request.into_inner();
+        let target = config::resolve(req.target.as_ref());
+        Ok(Response::new(blocking(move || git::commit(&target.config_dir, &req.message)).await?))
+    }
+
+    async fn git_diff(&self, request: Request<GitDiffRequest>) -> Result<Response<GitDiffReply>, Status> {
+        let req = request.into_inner();
+        let target = config::resolve(req.target.as_ref());
+        let reply = blocking(move || git::diff(&target.config_dir, &req.path, &req.old_path, req.staged)).await?;
         Ok(Response::new(reply))
     }
 }

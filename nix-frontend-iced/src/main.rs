@@ -1,4 +1,5 @@
 mod fx;
+mod git;
 mod inbox;
 mod store;
 mod theme;
@@ -13,11 +14,12 @@ use iced::widget::text_editor;
 use iced::{window, Subscription, Task};
 use nix_backend_client::settings::{self, Settings};
 use nix_backend_client::{
-    BuildItem, BuildStats, Client, Destination, EventPhase, FlakeStatusReply, OperationKind, Package, RebuildMode,
-    SearchPackagesReply, SetConfigPackageReply, SystemTarget,
+    BuildItem, BuildStats, Client, Destination, EventPhase, FlakeStatusReply, GitCommitReply, GitDiffReply,
+    GitStatusReply, OperationKind, Package, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
 };
 
 use fx::{Fx, Slot};
+use git::{Diff, Git, Selected};
 use inbox::{End, Inbox, Segment};
 use store::{Banner, BannerAction, Detail, Load, Snippet, Store, Tab};
 
@@ -85,6 +87,8 @@ pub enum CopyTarget {
     SourcePath,
     /// A snippet from the setup guide.
     Snippet(Snippet),
+    /// The diff of the open file on the git page.
+    Diff,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -92,6 +96,7 @@ pub enum Page {
     Dashboard,
     Settings,
     Store,
+    Git,
 }
 
 pub enum Conn {
@@ -192,6 +197,7 @@ pub struct App {
     pub log_hovered: bool,
     pub copied: Option<CopyTarget>,
     pub store: Store,
+    pub git: Git,
     pub fx: Fx,
     last_frame: Option<Instant>,
 }
@@ -252,6 +258,20 @@ pub enum Message {
     OpenGuide,
     DismissBanner,
     GoToDashboard,
+    OpenGit,
+    GitBack,
+    GitReload,
+    GitLoaded(SystemTarget, Result<GitStatusReply, String>),
+    GitSelect(Selected),
+    GitDiffLoaded(u64, Result<GitDiffReply, String>),
+    /// The paths to stage (or, with `false`, unstage); none means every file.
+    GitStage(Vec<String>, bool),
+    GitStaged(SystemTarget, Result<GitStatusReply, String>),
+    GitMessage(text_editor::Action),
+    GitCommit,
+    GitCommitted(SystemTarget, Result<GitCommitReply, String>),
+    GitDismissBanner,
+    WindowFocused,
 }
 
 fn status_text(status: nix_backend_client::Status) -> String {
@@ -321,6 +341,7 @@ impl App {
             log_hovered: false,
             copied: None,
             store: Store::new(),
+            git: Git::new(),
             fx: Fx::new(),
             last_frame: None,
         };
@@ -420,7 +441,8 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let task = self.handle(message);
-        self.fx.set_looping(self.busy() || self.store.busy() || matches!(self.conn, Conn::Connecting));
+        self.fx
+            .set_looping(self.busy() || self.store.busy() || self.git.busy() || matches!(self.conn, Conn::Connecting));
         if !self.fx.animating() {
             // Frames stop arriving once nothing moves; don't let the gap count
             // as one huge step when they resume.
@@ -561,6 +583,7 @@ impl App {
                 // Forget what we knew about the old target.
                 self.status = None;
                 self.store.reset();
+                self.git.reset();
                 self.load_status()
             }
             Message::Start(action) => {
@@ -624,6 +647,7 @@ impl App {
                         .and_then(|detail| detail.package.ready())
                         .map(|package| package.source_path.clone())
                         .unwrap_or_default(),
+                    CopyTarget::Diff => self.git.diff.ready().map(|diff| diff.raw.clone()).unwrap_or_default(),
                     CopyTarget::Snippet(kind) => {
                         store::snippet(kind, &self.store.destination, self.effective_host_name())
                     }
@@ -879,6 +903,133 @@ impl App {
                 self.show(Page::Dashboard);
                 Task::none()
             }
+            Message::OpenGit => {
+                self.show(Page::Git);
+                self.load_git()
+            }
+            Message::GitBack => {
+                self.show(Page::Dashboard);
+                Task::none()
+            }
+            Message::GitReload => self.load_git(),
+            // Coming back to the window is when files edited elsewhere need to show up.
+            Message::WindowFocused => {
+                if self.page == Page::Git && !self.git.working {
+                    self.load_git()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::GitLoaded(requested, result) => {
+                if requested != self.target() {
+                    return Task::none();
+                }
+                self.git.refreshing = false;
+                match result {
+                    Ok(status) => {
+                        self.git.set_status(status);
+                        self.reload_diff()
+                    }
+                    // Keep showing what we had if there is something.
+                    Err(error) if self.git.status.ready().is_some() => {
+                        self.git.banner = Some(Banner { text: error, error: true, action: None });
+                        Task::none()
+                    }
+                    Err(error) => {
+                        self.git.status = Load::Failed(error);
+                        Task::none()
+                    }
+                }
+            }
+            Message::GitSelect(selected) => {
+                self.git.selected = Some(selected);
+                self.git.diff = Load::Loading;
+                self.reload_diff()
+            }
+            Message::GitDiffLoaded(seq, result) => {
+                // Only the latest request counts.
+                if seq == self.git.diff_seq && self.git.selected.is_some() {
+                    self.git.diff = Load::from_result(result.map(|reply| Diff::new(reply.text, reply.truncated)));
+                }
+                Task::none()
+            }
+            Message::GitStage(paths, staged) => {
+                let Some(mut client) = self.client().filter(|_| !self.git.working) else {
+                    return Task::none();
+                };
+                self.git.working = true;
+                self.git.banner = None;
+                let target = self.target();
+                Task::perform(
+                    async move {
+                        let result = client.git_set_staged(target.clone(), paths, staged).await.map_err(status_text);
+                        (target, result)
+                    },
+                    |(target, result)| Message::GitStaged(target, result),
+                )
+            }
+            Message::GitStaged(requested, result) => {
+                self.git.working = false;
+                if requested != self.target() {
+                    return Task::none();
+                }
+                match result {
+                    Ok(status) => {
+                        self.git.set_status(status);
+                        self.reload_diff()
+                    }
+                    Err(error) => {
+                        self.git.banner = Some(Banner { text: error, error: true, action: None });
+                        Task::none()
+                    }
+                }
+            }
+            Message::GitMessage(action) => {
+                self.git.message.perform(action);
+                Task::none()
+            }
+            Message::GitCommit => {
+                let Some(mut client) = self.client().filter(|_| self.git.can_commit()) else {
+                    return Task::none();
+                };
+                self.git.working = true;
+                self.git.banner = None;
+                let target = self.target();
+                let message = self.git.message.text();
+                Task::perform(
+                    async move {
+                        let result = client.git_commit(target.clone(), message).await.map_err(status_text);
+                        (target, result)
+                    },
+                    |(target, result)| Message::GitCommitted(target, result),
+                )
+            }
+            Message::GitCommitted(requested, result) => {
+                self.git.working = false;
+                if requested != self.target() {
+                    return Task::none();
+                }
+                match result {
+                    Ok(commit) => {
+                        self.git.message = text_editor::Content::new();
+                        self.git.banner = Some(Banner {
+                            text: format!("Committed {} · {}", commit.hash, commit.subject),
+                            error: false,
+                            action: None,
+                        });
+                        // The dashboard shows the latest commit.
+                        Task::batch([self.load_git(), self.load_status()])
+                    }
+                    Err(error) => {
+                        self.git.banner = Some(Banner { text: error, error: true, action: None });
+                        Task::none()
+                    }
+                }
+            }
+            Message::GitDismissBanner => {
+                self.git.banner = None;
+                Task::none()
+            }
         }
     }
 
@@ -887,6 +1038,46 @@ impl App {
         if let Some(run) = &self.run {
             sync_log(&mut self.log_view, &mut self.log_pending, self.log_hovered, &run.log);
         }
+    }
+
+    fn load_git(&mut self) -> Task<Message> {
+        let Some(mut client) = self.client() else {
+            return Task::none();
+        };
+        // What is shown stays while it is read again.
+        if self.git.status.ready().is_some() {
+            self.git.refreshing = true;
+        } else {
+            self.git.status = Load::Loading;
+        }
+        let target = self.target();
+        Task::perform(
+            async move {
+                let result = client.git_status(target.clone()).await.map_err(status_text);
+                (target, result)
+            },
+            |(target, result)| Message::GitLoaded(target, result),
+        )
+    }
+
+    /// Fetches the diff of the selected file.
+    fn reload_diff(&mut self) -> Task<Message> {
+        let (Some(mut client), Some(selected)) = (self.client(), self.git.selected.clone()) else {
+            return Task::none();
+        };
+        let Some(file) = self.git.selected_file().cloned() else {
+            return Task::none();
+        };
+        self.git.diff_seq += 1;
+        let seq = self.git.diff_seq;
+        if self.git.diff.ready().is_none() {
+            self.git.diff = Load::Loading;
+        }
+        let target = self.target();
+        Task::perform(
+            async move { client.git_diff(target, &file, selected.staged).await.map_err(status_text) },
+            move |result| Message::GitDiffLoaded(seq, result),
+        )
     }
 
     fn load_destinations(&mut self) -> Task<Message> {
@@ -1002,7 +1193,9 @@ impl App {
                 // and what the configuration installs.
                 self.store.installed = Load::Idle;
                 let installed = if self.page == Page::Store { self.load_installed() } else { Task::none() };
-                Task::batch([self.load_status(), installed])
+                // An update rewrites flake.lock.
+                let git = if self.page == Page::Git { self.load_git() } else { Task::none() };
+                Task::batch([self.load_status(), installed, git])
             }
             Some(End::Failed(message)) => {
                 run.outcome = Outcome::Failed(message);
@@ -1022,6 +1215,12 @@ impl App {
         // Frames also run while events wait, so the next one shows them.
         if self.fx.animating() || self.inbox.has_pending() {
             subscriptions.push(window::frames().map(Message::Frame));
+        }
+        if self.page == Page::Git {
+            subscriptions.push(iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocused),
+                _ => None,
+            }));
         }
         if matches!(self.conn, Conn::Offline(_)) {
             subscriptions.push(iced::time::every(Duration::from_secs(2)).map(|_| Message::Retry));

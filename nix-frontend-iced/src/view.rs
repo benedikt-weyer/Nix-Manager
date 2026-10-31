@@ -14,7 +14,7 @@ use nix_backend_client::{
 
 use crate::fx::{Fx, Slot, SLIDE};
 use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
-use crate::{store, Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
+use crate::{git, store, Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
 
 /// How tall the output view is.
 const LOG_VIEW_HEIGHT: f32 = 260.0;
@@ -46,6 +46,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
         Page::Store => {
             sections = sections.push(reveal(fx, Slot::Overview, store::page(app)));
+        }
+        Page::Git => {
+            sections = sections.push(reveal(fx, Slot::Overview, git::page(app)));
         }
     }
 
@@ -92,10 +95,12 @@ fn header(app: &App) -> Element<'_, Message> {
         connection_pill(app),
         match app.page {
             Page::Dashboard => Element::from(
-                row![open_config_button(app), refresh_button(app), store_button(), settings_button()].spacing(4)
+                row![open_config_button(app), refresh_button(app), git_button(), store_button(), settings_button()]
+                    .spacing(4)
             ),
             Page::Settings => back_button(Message::CloseSettings),
             Page::Store => back_button(Message::StoreBack),
+            Page::Git => back_button(Message::GitBack),
         },
     ]
     .spacing(14)
@@ -161,6 +166,18 @@ fn open_config_button(app: &App) -> Element<'_, Message> {
         .max_width(480)
         .padding(8)
         .style(theme::card),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .into()
+}
+
+fn git_button<'a>() -> Element<'a, Message> {
+    iced::widget::tooltip(
+        button(centered_icon(lucide::git_branch(), 16.0, MUTED))
+            .padding(10)
+            .style(ghost_button)
+            .on_press(Message::OpenGit),
+        container(text("Git: review, stage and commit changes").size(12)).padding(8).style(theme::card),
         iced::widget::tooltip::Position::Bottom,
     )
     .into()

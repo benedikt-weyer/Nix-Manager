@@ -52,6 +52,20 @@ service NixBackend {
     // Adds a package to, or removes it from, one of those files. Adding to a
     // default destination that doesn't exist yet creates it.
     rpc SetConfigPackage(SetConfigPackageRequest) returns (SetConfigPackageReply);
+
+    // The state of the git repository the config directory belongs to: its
+    // branch and every staged, unstaged and untracked file.
+    rpc GitStatus(GitStatusRequest) returns (GitStatusReply);
+
+    // Stages or unstages files (all of them when `paths` is empty) and
+    // returns the status afterwards.
+    rpc GitSetStaged(GitSetStagedRequest) returns (GitStatusReply);
+
+    // Commits what is staged.
+    rpc GitCommit(GitCommitRequest) returns (GitCommitReply);
+
+    // The changes to one file as a unified diff.
+    rpc GitDiff(GitDiffRequest) returns (GitDiffReply);
 }
 
 // Only one UpdateFlake/Rebuild runs at a time per backend. Starting another
@@ -308,4 +322,92 @@ message SetConfigPackageReply {
     // The file was new to git, and was staged so that flakes can see it
     // (a flake only reads files git knows about).
     bool staged_in_git = 2;
+}
+
+// ---------------------------------------------------------------- git --
+// Everything below works on the git repository that contains the config
+// directory, and is the same whether or not that is the directory itself.
+
+enum GitChange {
+    GIT_CHANGE_NONE = 0;
+    GIT_CHANGE_ADDED = 1;
+    GIT_CHANGE_MODIFIED = 2;
+    GIT_CHANGE_DELETED = 3;
+    GIT_CHANGE_RENAMED = 4;
+    GIT_CHANGE_COPIED = 5;
+    GIT_CHANGE_TYPE_CHANGED = 6;
+    // Not known to git at all. Only ever an unstaged change.
+    GIT_CHANGE_UNTRACKED = 7;
+    // A merge conflict. Only ever an unstaged change.
+    GIT_CHANGE_CONFLICTED = 8;
+}
+
+// One file with changes. A file can be in both lists at once: staged, and
+// then changed again.
+message GitFile {
+    // Relative to the repository root.
+    string path = 1;
+    // Where a renamed or copied file came from; empty otherwise.
+    string old_path = 2;
+    // What is staged for the next commit; NONE if nothing is.
+    GitChange staged = 3;
+    // What differs between the index and the working tree; NONE if nothing.
+    GitChange unstaged = 4;
+}
+
+message GitStatusRequest {
+    SystemTarget target = 1;
+}
+
+message GitStatusReply {
+    // False when the config directory isn't inside a git repository; the
+    // rest of the reply is empty then.
+    bool is_repo = 1;
+    string repo_root = 2;
+    // Empty when HEAD is detached.
+    string branch = 3;
+    bool detached = 4;
+    // The branch it tracks, e.g. "origin/main"; empty if none.
+    string upstream = 5;
+    uint32 ahead = 6;
+    uint32 behind = 7;
+    // Sorted by path.
+    repeated GitFile files = 8;
+}
+
+message GitSetStagedRequest {
+    SystemTarget target = 1;
+    // Relative to the repository root. Empty means every file.
+    repeated string paths = 2;
+    // true stages, false unstages.
+    bool staged = 3;
+}
+
+message GitCommitRequest {
+    SystemTarget target = 1;
+    string message = 2;
+}
+
+message GitCommitReply {
+    // Abbreviated hash of the new commit.
+    string hash = 1;
+    string subject = 2;
+}
+
+message GitDiffRequest {
+    SystemTarget target = 1;
+    string path = 2;
+    // For a renamed file, where it was, so that the diff shows a rename
+    // rather than a new file.
+    string old_path = 3;
+    // true for what is staged (index against HEAD), false for what is not
+    // (working tree against index; a new file against nothing).
+    bool staged = 4;
+}
+
+message GitDiffReply {
+    // Unified diff text; empty if there is nothing to show.
+    string text = 1;
+    // The diff was cut off because it is too large.
+    bool truncated = 2;
 }
