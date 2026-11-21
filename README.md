@@ -72,6 +72,23 @@ nix-manager boot scan           # entries and files, unused ones marked
 nix-manager boot clean          # delete the unused files
 nix-manager boot prune --keep 5 # delete older generations, rewrite the menu
 nix-manager boot reinstall
+nix-manager boot signing        # Secure Boot state and what to do next
+```
+
+### Secure Boot signing
+
+The boot page's last card manages the key that signs the bootloader. For **r-boot** (`boot.loader.r-boot.sign-bootloader`) it can create, replace and remove the key (through `r-boot-cli sign-key`) and sign the bootloader again, and **Check key** reports whether the key exists, what the installed `BOOTX64.EFI` was signed with, and whether the firmware's `db` holds the certificate. It then says what is left to do: sign, enroll the certificate from r-boot's menu (`e`), and turn Secure Boot on in the firmware.
+
+What the firmware says (Secure Boot on/off, setup mode, the number of certificates in `db`) and what the installer does are read without privileges. Looking at the key and changing it ask for authorization, because its directory is root-only. Replacing or removing the key is refused while Secure Boot is on (the firmware would refuse the bootloader), and removing it while the installer is set to sign (every rebuild would fail).
+
+The stock NixOS modules for systemd-boot and GRUB sign nothing, so for them only the firmware's state is shown.
+
+```sh
+nix-manager boot signing check   # the key, the signature and the firmware's certificates
+nix-manager boot signing create --sign
+nix-manager boot signing sign    # run the installer again, which signs
+nix-manager boot signing replace # new key; the firmware has to learn it again
+nix-manager boot signing remove
 ```
 
 ## Assistant

@@ -16,7 +16,7 @@ use iced::widget::text_editor;
 use iced::{window, Subscription, Task};
 use nix_backend_client::settings::{self, Settings};
 use nix_backend_client::{
-    BootInfo, BootScan, BuildItem, BuildStats, Client, MaintainBootReply, Destination, EventPhase, FlakeStatusReply, GitCommitReply, GitDiffReply,
+    BootInfo, BootScan, SigningAction, SigningScan, BuildItem, BuildStats, Client, MaintainBootReply, Destination, EventPhase, FlakeStatusReply, GitCommitReply, GitDiffReply,
     GitStatusReply, OperationKind, Package, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
 };
 
@@ -306,6 +306,10 @@ pub enum Message {
     BootCancelAsk,
     BootConfirm,
     BootReinstall,
+    BootSigningCheck,
+    BootSigningChecked(Result<SigningScan, String>),
+    /// Create the signing key and/or sign the bootloader.
+    BootSign(SigningAction, bool),
     /// What was done, for the banner, and how it went.
     BootMaintained(String, Result<MaintainBootReply, String>),
     BootDismissBanner,
@@ -1221,11 +1225,45 @@ impl App {
                         (format!("Deleted {} generation(s)", generations.len()), Vec::new(), generations)
                     }
                     Ask::Generation(number) => (format!("Deleted generation {number}"), Vec::new(), vec![number]),
+                    Ask::ReplaceKey => {
+                        return self.manage_signing("Replaced the signing key".to_owned(), SigningAction::ReplaceKey, true)
+                    }
+                    Ask::RemoveKey => {
+                        return self.manage_signing("Deleted the signing key".to_owned(), SigningAction::RemoveKey, false)
+                    }
                 };
                 self.maintain_boot(what, files, generations, false)
             }
             Message::BootReinstall => {
                 self.maintain_boot("Reinstalled the bootloader".to_owned(), Vec::new(), Vec::new(), true)
+            }
+            Message::BootSigningCheck => {
+                let Some(mut client) = self.client().filter(|_| !self.boot.signing.loading() && !self.boot.working) else {
+                    return Task::none();
+                };
+                self.boot.signing = Load::Loading;
+                self.boot.banner = None;
+                self.boot.ask = None;
+                Task::perform(async move { client.scan_signing().await.map_err(status_text) }, Message::BootSigningChecked)
+            }
+            Message::BootSigningChecked(result) => {
+                match result {
+                    Ok(scan) => self.boot.signing = Load::Ready(scan),
+                    // The earlier check stays when a newer one fails.
+                    Err(error) if self.boot.signing.ready().is_some() => {
+                        self.boot.banner = Some(Banner { text: error, error: true, action: None });
+                    }
+                    Err(error) => self.boot.signing = Load::Failed(error),
+                }
+                Task::none()
+            }
+            Message::BootSign(action, sign) => {
+                let what = match (action, sign) {
+                    (SigningAction::CreateKey, true) => "Created the signing key and signed the bootloader",
+                    (SigningAction::CreateKey, false) => "Created the signing key",
+                    _ => "Signed the bootloader",
+                };
+                self.manage_signing(what.to_owned(), action, sign)
             }
             Message::BootMaintained(what, result) => {
                 self.boot.working = false;
@@ -1245,6 +1283,7 @@ impl App {
                 }
                 // What was scanned is out of date now; scanning again asks for authorization again.
                 self.boot.scan = Load::Idle;
+                self.boot.signing = Load::Idle;
                 self.load_boot()
             }
             Message::BootDismissBanner => {
@@ -1338,6 +1377,28 @@ impl App {
             self.boot.info = Load::Loading;
         }
         Task::perform(async move { client.boot_info().await.map_err(status_text) }, Message::BootInfoLoaded)
+    }
+
+    /// Creates, replaces or removes the signing key and/or signs the bootloader, under one authorization.
+    fn manage_signing(&mut self, what: String, action: SigningAction, sign: bool) -> Task<Message> {
+        let Some(mut client) = self.client().filter(|_| !self.boot.working) else {
+            return Task::none();
+        };
+        self.boot.working = true;
+        self.boot.ask = None;
+        self.boot.banner = None;
+        self.boot.output = None;
+        Task::perform(
+            async move {
+                let result = client
+                    .manage_signing(action, sign)
+                    .await
+                    .map(|reply| MaintainBootReply { output: reply.output })
+                    .map_err(status_text);
+                (what, result)
+            },
+            |(what, result)| Message::BootMaintained(what, result),
+        )
     }
 
     /// Deletes files and generations and/or reinstalls the bootloader, under one authorization.
@@ -1515,6 +1576,7 @@ impl App {
                 let git = if self.page == Page::Git { self.load_git() } else { Task::none() };
                 // A rebuild writes to the boot partition.
                 self.boot.scan = Load::Idle;
+                self.boot.signing = Load::Idle;
                 let boot = if self.page == Page::Boot { self.load_boot() } else { Task::none() };
                 Task::batch([self.load_status(), installed, git, boot])
             }

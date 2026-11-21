@@ -30,7 +30,7 @@ use crate::proto::{
     MaintainBootRequest,
 };
 
-const PROFILES_DIR: &str = "/nix/var/nix/profiles";
+pub(crate) const PROFILES_DIR: &str = "/nix/var/nix/profiles";
 
 /// Where an ESP is mounted when the installer doesn't say.
 const MOUNT_CANDIDATES: [&str; 3] = ["/boot", "/boot/efi", "/efi"];
@@ -85,9 +85,9 @@ fi
 // ------------------------------------------------------------------- info --
 
 /// What the installer script says about itself.
-struct Installer {
-    path: String,
-    text: String,
+pub(crate) struct Installer {
+    pub(crate) path: String,
+    pub(crate) text: String,
 }
 
 /// The line of `switch-to-configuration` that names the installer:
@@ -209,7 +209,7 @@ fn probe(mount: &str) -> Bootloader {
     }
 }
 
-fn canonical(path: impl AsRef<Path>) -> Option<PathBuf> {
+pub(crate) fn canonical(path: impl AsRef<Path>) -> Option<PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
@@ -304,6 +304,7 @@ pub fn info() -> BootInfo {
 
     BootInfo {
         bootloader: loader as i32,
+        signing: Some(crate::signing::info(loader, installer.as_ref())),
         installer: installer.map(|installer| installer.path).unwrap_or_default(),
         is_mount: mount.is_some(),
         device: mount.map(|mount| mount.source.clone()).unwrap_or_default(),
@@ -548,7 +549,7 @@ fn classify(raw: Vec<RawFile>, entries: &[BootEntry], kernel_dir: &str) -> Vec<B
 
 /// Runs a script as `sh -c`, through `pkexec` when `elevate`. Returns whether
 /// it succeeded and everything it printed.
-async fn run_script(elevate: bool, script: &str, args: &[String]) -> Result<(bool, String), Status> {
+pub(crate) async fn run_script(elevate: bool, script: &str, args: &[String]) -> Result<(bool, String), Status> {
     let mut command = if elevate {
         let mut command = Command::new("pkexec");
         command.args(["sh", "-c", script, "sh"]);
@@ -569,7 +570,7 @@ async fn run_script(elevate: bool, script: &str, args: &[String]) -> Result<(boo
     Ok((output.status.success(), text))
 }
 
-fn require_elevation() -> Result<(), Status> {
+pub(crate) fn require_elevation() -> Result<(), Status> {
     if no_new_privs() {
         return Err(Status::failed_precondition(
             "Cannot elevate: this backend runs with no_new_privs set (inherited from the process that started it), so \

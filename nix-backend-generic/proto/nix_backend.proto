@@ -87,6 +87,16 @@ service NixBackend {
     // authorization. Takes the operation slot, so it is rejected while an
     // update or rebuild runs (and the other way round).
     rpc MaintainBoot(MaintainBootRequest) returns (MaintainBootReply);
+
+    // Inspects the Secure Boot signing key and what it signed. The key
+    // directory is root-only, so this asks for authorization. Only r-boot's keys
+    // are managed from here.
+    rpc ScanSigning(ScanSigningRequest) returns (SigningScan);
+
+    // Creates, replaces or removes the signing key and/or signs the bootloader
+    // (which reinstalls it), under a single authorization. Takes the operation
+    // slot like MaintainBoot.
+    rpc ManageSigning(ManageSigningRequest) returns (ManageSigningReply);
 }
 
 // Only one UpdateFlake/Rebuild runs at a time per backend. Starting another
@@ -503,6 +513,7 @@ message BootInfo {
     string kernel_dir = 12;
     // Newest first.
     repeated BootGeneration generations = 13;
+    SigningInfo signing = 14;
 }
 
 message ScanBootRequest {}
@@ -562,5 +573,84 @@ message MaintainBootRequest {
 
 message MaintainBootReply {
     // What the privileged steps printed.
+    string output = 1;
+}
+
+// ------------------------------------------------------------ signing --
+
+enum SecureBootState {
+    // Not booted through UEFI, or the firmware doesn't say.
+    SECURE_BOOT_STATE_UNKNOWN = 0;
+    SECURE_BOOT_STATE_DISABLED = 1;
+    SECURE_BOOT_STATE_ENABLED = 2;
+}
+
+// What can be told about signing without authorization.
+message SigningInfo {
+    SecureBootState secure_boot = 1;
+    // The firmware has no platform key and accepts new ones.
+    bool setup_mode = 2;
+    // The bootloader's installer signs the bootloader on every rebuild (for
+    // r-boot: boot.loader.r-boot.sign-bootloader).
+    bool signs_bootloader = 3;
+    // The keys can be managed from here: r-boot, with its CLI installed.
+    bool manageable = 4;
+    // The r-boot-cli that does it; empty when it isn't installed.
+    string tool = 5;
+    // Where the installer looks for the private key and the certificate.
+    string key_path = 6;
+    string cert_path = 7;
+    // How many certificates the firmware's signature database (db) holds.
+    uint32 firmware_certs = 8;
+}
+
+enum SigningCheck {
+    SIGNING_CHECK_UNKNOWN = 0;
+    SIGNING_CHECK_NO = 1;
+    SIGNING_CHECK_YES = 2;
+}
+
+message ScanSigningRequest {}
+
+message SigningScan {
+    bool key_present = 1;
+    bool cert_present = 2;
+    string cert_subject = 3;
+    // As OpenSSL prints it, e.g. "Nov 21 10:00:00 2036 GMT".
+    string cert_not_after = 4;
+    // SHA-256, colon-separated.
+    string cert_fingerprint = 5;
+    bool bootloader_installed = 6;
+    // The installed bootloader carries a signature.
+    SigningCheck bootloader_signed = 7;
+    // ... made with the certificate above.
+    SigningCheck signed_with_cert = 8;
+    // The certificate is in the firmware's signature database, so the firmware
+    // will start what it signed.
+    SigningCheck enrolled = 9;
+    // What `r-boot-cli status` printed.
+    string output = 10;
+}
+
+enum SigningAction {
+    SIGNING_ACTION_NONE = 0;
+    // Generates a key and certificate; fails when there already is one.
+    SIGNING_ACTION_CREATE_KEY = 1;
+    // Generates new ones in place of the old. The firmware has to learn the new
+    // certificate again. Refused while Secure Boot is on.
+    SIGNING_ACTION_REPLACE_KEY = 2;
+    // Deletes the key for good. Refused while Secure Boot is on, and while the
+    // installer is set to sign (every rebuild would then fail).
+    SIGNING_ACTION_REMOVE_KEY = 3;
+}
+
+message ManageSigningRequest {
+    SigningAction action = 1;
+    // Run the installer again, which signs the bootloader with the key as it
+    // is after `action`.
+    bool sign_bootloader = 2;
+}
+
+message ManageSigningReply {
     string output = 1;
 }

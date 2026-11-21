@@ -8,6 +8,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod settings;
+pub mod signing;
 
 use std::path::{Path, PathBuf};
 
@@ -23,18 +24,19 @@ pub mod proto {
 pub mod diff;
 
 pub use proto::{
-    BootEntry, BootFile, BootFileState, BootGeneration, BootInfo, BootScan, Bootloader, MaintainBootReply,
-    BuildItem, BuildItemKind, BuildItemStatus, BuildStats, Destination, EventPhase, FlakeStatusReply, GitChange,
-    GitCommitReply, GitDiffReply, GitFile, GitStatusReply, Maintainer, OperationEvent, OperationKind, Package,
-    PackageSummary, ProgressEvent, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
+    BootEntry, BootFile, BootFileState, BootGeneration, BootInfo, BootScan, Bootloader, BuildItem, BuildItemKind,
+    BuildItemStatus, BuildStats, Destination, EventPhase, FlakeStatusReply, GitChange, GitCommitReply, GitDiffReply,
+    GitFile, GitStatusReply, MaintainBootReply, Maintainer, ManageSigningReply, OperationEvent, OperationKind, Package,
+    PackageSummary, ProgressEvent, RebuildMode, SearchPackagesReply, SecureBootState, SetConfigPackageReply,
+    SigningAction, SigningCheck, SigningInfo, SigningScan, SystemTarget,
 };
 
 use proto::nix_backend_client::NixBackendClient;
 use proto::{
-    BootInfoRequest, MaintainBootRequest, ScanBootRequest, CancelOperationRequest, CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest, GitCommitRequest,
-    GitDiffRequest,
-    GitSetStagedRequest, GitStatusRequest, ListDestinationsRequest, ListInstalledRequest, RebuildRequest,
-    SearchPackagesRequest, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
+    BootInfoRequest, CancelOperationRequest, CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest,
+    GitCommitRequest, GitDiffRequest, GitSetStagedRequest, GitStatusRequest, ListDestinationsRequest,
+    ListInstalledRequest, MaintainBootRequest, ManageSigningRequest, RebuildRequest, ScanBootRequest,
+    ScanSigningRequest, SearchPackagesRequest, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
 };
 
 impl GitFile {
@@ -312,6 +314,24 @@ impl Client {
     ) -> Result<MaintainBootReply, Status> {
         let request = MaintainBootRequest { delete_files, delete_generations, reinstall };
         Ok(self.inner.maintain_boot(request).await?.into_inner())
+    }
+
+    /// Inspects the Secure Boot signing key and what it signed. Asks for
+    /// authorization; fails unless the bootloader is r-boot with its CLI installed.
+    pub async fn scan_signing(&mut self) -> Result<SigningScan, Status> {
+        Ok(self.inner.scan_signing(ScanSigningRequest {}).await?.into_inner())
+    }
+
+    /// Creates, replaces or removes the signing key, and/or (`sign_bootloader`)
+    /// signs the bootloader by running its installer again. One authorization.
+    /// The backend refuses what would leave the system unable to boot.
+    pub async fn manage_signing(
+        &mut self,
+        action: SigningAction,
+        sign_bootloader: bool,
+    ) -> Result<ManageSigningReply, Status> {
+        let request = ManageSigningRequest { action: action as i32, sign_bootloader };
+        Ok(self.inner.manage_signing(request).await?.into_inner())
     }
 
     /// Every event of every operation, whoever started it. Frontends should

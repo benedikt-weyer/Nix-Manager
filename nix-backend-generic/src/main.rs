@@ -4,6 +4,7 @@ mod config;
 mod destinations;
 mod git;
 mod nix_ops;
+mod signing;
 mod store;
 
 pub mod proto {
@@ -28,7 +29,8 @@ use proto::{
     GitCommitRequest, GitDiffReply, GitDiffRequest, GitSetStagedRequest, GitStatusReply, GitStatusRequest,
     ListDestinationsReply, ListDestinationsRequest, ListInstalledReply, ListInstalledRequest, OperationEvent,
     OperationKind, Package, ProgressEvent, RebuildMode, RebuildRequest, SearchPackagesReply, SearchPackagesRequest,
-    MaintainBootReply, MaintainBootRequest, ScanBootRequest, SetConfigPackageReply, SetConfigPackageRequest,
+    MaintainBootReply, MaintainBootRequest, ManageSigningReply, ManageSigningRequest, ScanBootRequest,
+    ScanSigningRequest, SigningScan, SetConfigPackageReply, SetConfigPackageRequest,
     UpdateFlakeRequest, WatchRequest,
 };
 
@@ -263,6 +265,21 @@ impl NixBackend for Service {
         // so this takes the same slot.
         self.hub.begin(OperationKind::BootMaintenance, RebuildMode::Unspecified)?;
         let result = boot::maintain(request.into_inner()).await;
+        self.hub.end();
+        Ok(Response::new(result?))
+    }
+
+    async fn scan_signing(&self, _request: Request<ScanSigningRequest>) -> Result<Response<SigningScan>, Status> {
+        Ok(Response::new(signing::scan().await?))
+    }
+
+    async fn manage_signing(
+        &self,
+        request: Request<ManageSigningRequest>,
+    ) -> Result<Response<ManageSigningReply>, Status> {
+        // Signing reinstalls the bootloader, so it shares the slot with rebuilds.
+        self.hub.begin(OperationKind::BootMaintenance, RebuildMode::Unspecified)?;
+        let result = signing::manage(request.into_inner()).await;
         self.hub.end();
         Ok(Response::new(result?))
     }

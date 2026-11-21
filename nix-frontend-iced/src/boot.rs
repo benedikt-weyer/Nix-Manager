@@ -10,7 +10,11 @@ use iced::widget::text::Wrapping;
 use iced::widget::{button, column, container, row, space, text, tooltip};
 use iced::{Alignment, Background, Border, Color, Element, Length};
 use iced_fonts::lucide;
-use nix_backend_client::{format_bytes, BootFile, BootFileState, BootGeneration, BootInfo, BootScan, Bootloader};
+use nix_backend_client::signing::{advise, Level};
+use nix_backend_client::{
+    format_bytes, BootFile, BootFileState, BootGeneration, BootInfo, BootScan, Bootloader, SecureBootState,
+    SigningAction, SigningCheck, SigningInfo, SigningScan,
+};
 
 use crate::store::{card_with, failure, notice, working, Banner, Load};
 use crate::theme::{self, ACCENT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
@@ -32,12 +36,18 @@ pub enum Ask {
     Prune,
     /// Delete one generation.
     Generation(u64),
+    /// Generate a new signing key in place of the old one.
+    ReplaceKey,
+    /// Delete the signing key.
+    RemoveKey,
 }
 
 pub struct Boot {
     pub info: Load<BootInfo>,
     /// Idle until the user asks: it needs authorization.
     pub scan: Load<BootScan>,
+    /// The signing key as it is; idle until the user checks it, which needs authorization.
+    pub signing: Load<SigningScan>,
     /// The info is being fetched again; what is shown stays until it arrives.
     pub refreshing: bool,
     /// Files or generations are being deleted.
@@ -56,6 +66,7 @@ impl Boot {
         Self {
             info: Load::Idle,
             scan: Load::Idle,
+            signing: Load::Idle,
             refreshing: false,
             working: false,
             banner: None,
@@ -67,7 +78,7 @@ impl Boot {
     }
 
     pub fn busy(&self) -> bool {
-        self.info.loading() || self.scan.loading() || self.working
+        self.info.loading() || self.scan.loading() || self.signing.loading() || self.working
     }
 
     /// Takes in new info, and unless the user picked a number, suggests keeping
@@ -155,7 +166,7 @@ fn overview<'a>(app: &'a App, info: &'a BootInfo) -> Element<'a, Message> {
             "Waiting for authorization, then deleting and rewriting the boot menu.",
         ));
     }
-    page.push(menu_card(app, info)).push(generations_card(app, info)).into()
+    page.push(menu_card(app, info)).push(generations_card(app, info)).push(signing_card(app, info)).into()
 }
 
 // -------------------------------------------------------------- partition --
@@ -603,6 +614,220 @@ fn generation_row<'a>(
         .into()
     } else {
         line.into()
+    }
+}
+
+// ---------------------------------------------------------------- signing --
+
+fn signing_card<'a>(app: &'a App, info: &'a BootInfo) -> Element<'a, Message> {
+    let boot = &app.boot;
+    let Some(signing) = info.signing.as_ref() else {
+        return space::vertical().height(0).into();
+    };
+    let scan = boot.signing.ready();
+
+    let check = button(
+        row![lucide::scan_search().size(13), text(if scan.is_some() { "Check again" } else { "Check key" }).size(13)]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .padding([8, 14])
+    .style(if matches!(boot.signing, Load::Idle) { theme::primary_button } else { ghost_button })
+    .on_press_maybe(
+        (signing.manageable && !boot.signing.loading() && !boot.working).then_some(Message::BootSigningCheck),
+    );
+
+    let mut header = row![
+        lucide::shield_check().size(15).color(ACCENT),
+        text("Secure Boot signing").size(15).font(BOLD),
+        space::horizontal(),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    if signing.manageable {
+        header = header.push(check);
+    }
+
+    let mut body = column![header, signing_chips(signing)].spacing(14);
+
+    match &boot.signing {
+        Load::Idle => {}
+        Load::Loading => {
+            body = body.push(working(
+                &app.fx,
+                "Inspecting the signing key…".to_owned(),
+                "Waiting for authorization, then reading the key, the signature and the firmware's certificates.",
+            ))
+        }
+        Load::Failed(error) => body = body.push(failure("Could not inspect the signing key", error)),
+        Load::Ready(scan) => body = body.push(key_facts(scan)),
+    }
+
+    for item in advise(info.loader(), signing, scan) {
+        let (icon, tint) = match item.level {
+            Level::Done => (lucide::circle_check(), SUCCESS),
+            Level::Todo => (lucide::move_right(), ACCENT),
+            Level::Warn => (lucide::triangle_alert(), DANGER),
+            Level::Info => (lucide::info(), MUTED),
+        };
+        body = body.push(
+            row![icon.size(14).color(tint), text(item.text).size(13).width(Length::Fill)]
+                .spacing(10)
+                .align_y(Alignment::Start),
+        );
+    }
+
+    if let (true, Some(scan)) = (signing.manageable, scan) {
+        body = body.push(signing_actions(app, signing, scan));
+    }
+
+    card_with(body.into(), 20)
+}
+
+fn signing_chips(signing: &SigningInfo) -> Element<'_, Message> {
+    let (icon, label, tint, hint) = match signing.secure_boot() {
+        SecureBootState::Enabled => (
+            lucide::shield_check(),
+            "Secure Boot on",
+            SUCCESS,
+            "The firmware only starts what is signed with a certificate it knows",
+        ),
+        SecureBootState::Disabled => (
+            lucide::shield_alert(),
+            "Secure Boot off",
+            WARNING,
+            "The firmware starts anything; signing does nothing until Secure Boot is turned on",
+        ),
+        SecureBootState::Unknown => {
+            (lucide::info(), "not UEFI", MUTED, "This machine did not start through UEFI, so there is no Secure Boot")
+        }
+    };
+    let mut chips = row![chip(icon, label.to_owned(), tint, hint)].spacing(8).align_y(Alignment::Center);
+    if signing.setup_mode {
+        chips = chips.push(chip(
+            lucide::info(),
+            "setup mode".to_owned(),
+            WARNING,
+            "The firmware has no platform key and accepts new keys without a signature",
+        ));
+    }
+    chips = chips.push(chip(
+        lucide::file_code(),
+        if signing.signs_bootloader { "installer signs" } else { "installer does not sign" }.to_owned(),
+        if signing.signs_bootloader { TEAL } else { MUTED },
+        "Whether the bootloader's installer signs it on every rebuild (boot.loader.r-boot.sign-bootloader)",
+    ));
+    chips = chips.push(chip(
+        lucide::list_checks(),
+        format!("{} certificates in the firmware", signing.firmware_certs),
+        MUTED,
+        "What the firmware's signature database (db) holds",
+    ));
+    chips.into()
+}
+
+fn key_facts(scan: &SigningScan) -> Element<'_, Message> {
+    let present = |yes: bool| if yes { SigningCheck::Yes } else { SigningCheck::No };
+    let mut rows = column![
+        fact("Private key", mark(present(scan.key_present), "present", "missing")),
+        fact("Certificate", mark(present(scan.cert_present), "present", "missing")),
+    ]
+    .spacing(6);
+    if !scan.cert_subject.is_empty() {
+        rows = rows
+            .push(fact("Subject", clipped(text(scan.cert_subject.clone()).size(13))))
+            .push(fact("Valid until", text(scan.cert_not_after.clone()).size(13).into()))
+            .push(fact(
+                "SHA-256",
+                clipped(text(scan.cert_fingerprint.clone()).size(11).font(iced::Font::MONOSPACE).color(MUTED)),
+            ));
+    }
+    if scan.cert_present {
+        rows = rows
+            .push(fact("Bootloader signed", mark(scan.bootloader_signed(), "yes", "no")))
+            .push(fact("Signed with this key", mark(scan.signed_with_cert(), "yes", "no")))
+            .push(fact("Known to the firmware", mark(scan.enrolled(), "yes", "no")));
+    }
+    container(rows).padding([12, 14]).width(Length::Fill).style(theme::well).into()
+}
+
+fn fact<'a>(label: &'static str, value: Element<'a, Message>) -> Element<'a, Message> {
+    row![container(text(label).size(13).color(MUTED)).width(170), value].spacing(12).align_y(Alignment::Center).into()
+}
+
+fn mark<'a>(check: SigningCheck, yes: &'static str, no: &'static str) -> Element<'a, Message> {
+    let (icon, tint, label) = match check {
+        SigningCheck::Yes => (lucide::circle_check(), SUCCESS, yes),
+        SigningCheck::No => (lucide::circle_x(), DANGER, no),
+        SigningCheck::Unknown => (lucide::info(), MUTED, "unknown"),
+    };
+    row![icon.size(13).color(tint), text(label).size(13).color(tint)].spacing(6).align_y(Alignment::Center).into()
+}
+
+fn signing_actions<'a>(app: &'a App, signing: &'a SigningInfo, scan: &'a SigningScan) -> Element<'a, Message> {
+    let boot = &app.boot;
+    let free = !boot.working;
+    let secure_boot = signing.secure_boot_on();
+    let action = |icon: iced::widget::Text<'a>, label: &'static str| {
+        row![icon.size(13), text(label).size(13)].spacing(8).align_y(Alignment::Center)
+    };
+
+    if let Some(question) = match boot.ask {
+        Some(Ask::ReplaceKey) => Some((
+            "Replace the signing key? The firmware has to learn the new certificate again, and the bootloader is \
+             signed with the new key right away.",
+            "Replace key",
+        )),
+        Some(Ask::RemoveKey) => Some(("Delete the private key for good? It cannot be restored.", "Delete key")),
+        _ => None,
+    } {
+        return confirm_bar(question.0.to_owned(), question.1);
+    }
+
+    let mut actions = row![].spacing(8).align_y(Alignment::Center);
+    if !scan.key_present {
+        actions = actions
+            .push(
+                button(action(lucide::key_round(), "Create key and sign bootloader"))
+                    .padding([8, 14])
+                    .style(theme::primary_button)
+                    .on_press_maybe(free.then_some(Message::BootSign(SigningAction::CreateKey, true))),
+            )
+            .push(
+                button(action(lucide::key_round(), "Create key only"))
+                    .padding([8, 14])
+                    .style(ghost_button)
+                    .on_press_maybe(free.then_some(Message::BootSign(SigningAction::CreateKey, false))),
+            );
+    } else {
+        actions = actions
+            .push(
+                button(action(lucide::pen_line(), "Sign bootloader"))
+                    .padding([8, 14])
+                    .style(theme::primary_button)
+                    .on_press_maybe(free.then_some(Message::BootSign(SigningAction::None, true))),
+            )
+            .push(
+                button(action(lucide::refresh_cw(), "Replace key"))
+                    .padding([8, 14])
+                    .style(ghost_button)
+                    .on_press_maybe((free && !secure_boot).then_some(Message::BootAsk(Ask::ReplaceKey))),
+            )
+            .push(button(action(lucide::trash(), "Remove key")).padding([8, 14]).style(ghost_button).on_press_maybe(
+                (free && !secure_boot && !signing.signs_bootloader).then_some(Message::BootAsk(Ask::RemoveKey)),
+            ));
+    }
+
+    let hint = if scan.key_present && secure_boot {
+        Some("Replacing or removing the key is blocked while Secure Boot is on: the firmware would refuse the bootloader.")
+    } else if scan.key_present && signing.signs_bootloader {
+        Some("The key can't be removed while the installer is set to sign with it: every rebuild would fail.")
+    } else {
+        None
+    };
+    match hint {
+        Some(hint) => column![actions, text(hint).size(12).color(MUTED)].spacing(8).into(),
+        None => actions.into(),
     }
 }
 
