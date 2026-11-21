@@ -1,3 +1,5 @@
+mod boot;
+
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -55,6 +57,11 @@ enum Command {
     Cancel,
     /// Follow the running (or next) operation, e.g. one started from a GUI; exits when it ends
     Watch,
+    /// The bootloader and the boot partition: usage, generations, files, cleaning and pruning
+    Boot {
+        #[command(subcommand)]
+        command: Option<boot::BootCommand>,
+    },
     /// Print a shell completion script, e.g. `source <(nix-manager completions zsh)`
     Completions { shell: Shell },
 }
@@ -166,6 +173,7 @@ async fn run(cli: Cli) -> Result<ExitCode, String> {
                 }
             }
         }
+        Command::Boot { command } => boot::run(&mut client, command).await,
         Command::Completions { .. } => unreachable!("handled before connecting"),
     }
 }

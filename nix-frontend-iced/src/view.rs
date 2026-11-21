@@ -14,7 +14,7 @@ use nix_backend_client::{
 
 use crate::fx::{Fx, Slot, SLIDE};
 use crate::theme::{self, ACCENT, ACCENT_ALT, DANGER, MUTED, SUCCESS, TEAL, TEXT, WARNING};
-use crate::{ai, git, store, Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
+use crate::{ai, boot, git, store, Action, App, Conn, CopyTarget, Message, Outcome, Page, Run};
 
 /// How tall the output view is.
 const LOG_VIEW_HEIGHT: f32 = 260.0;
@@ -49,6 +49,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
         Page::Git => {
             sections = sections.push(reveal(fx, Slot::Overview, git::page(app)));
+        }
+        Page::Boot => {
+            sections = sections.push(reveal(fx, Slot::Overview, boot::page(app)));
         }
         Page::Ai => {
             sections = sections.push(reveal(fx, Slot::Overview, ai::page(app)));
@@ -103,6 +106,7 @@ fn header(app: &App) -> Element<'_, Message> {
                     refresh_button(app),
                     ai_button(),
                     git_button(),
+                    boot_button(),
                     store_button(),
                     settings_button()
                 ]
@@ -111,6 +115,7 @@ fn header(app: &App) -> Element<'_, Message> {
             Page::Settings => back_button(Message::CloseSettings),
             Page::Store => back_button(Message::StoreBack),
             Page::Git => back_button(Message::GitBack),
+            Page::Boot => back_button(Message::BootBack),
             Page::Ai => back_button(Message::AiBack),
         },
     ]
@@ -203,6 +208,18 @@ fn git_button<'a>() -> Element<'a, Message> {
             .style(ghost_button)
             .on_press(Message::OpenGit),
         container(text("Git: review, stage and commit changes").size(12)).padding(8).style(theme::card),
+        iced::widget::tooltip::Position::Bottom,
+    )
+    .into()
+}
+
+fn boot_button<'a>() -> Element<'a, Message> {
+    iced::widget::tooltip(
+        button(centered_icon(lucide::hard_drive(), 16.0, MUTED))
+            .padding(10)
+            .style(ghost_button)
+            .on_press(Message::OpenBoot),
+        container(text("Boot: bootloader entries and the boot partition").size(12)).padding(8).style(theme::card),
         iced::widget::tooltip::Position::Bottom,
     )
     .into()

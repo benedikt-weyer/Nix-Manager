@@ -1,4 +1,5 @@
 mod activity;
+mod boot;
 mod config;
 mod destinations;
 mod git;
@@ -23,11 +24,12 @@ use tonic::{Request, Response, Status};
 use nix_ops::Cancel;
 use proto::nix_backend_server::{NixBackend, NixBackendServer};
 use proto::{
-    CancelOperationReply, CancelOperationRequest, CreateDestinationRequest, Destination, FlakeStatusReply, FlakeStatusRequest, GetPackageRequest, GitCommitReply,
+    BootInfo, BootInfoRequest, BootScan, CancelOperationReply, CancelOperationRequest, CreateDestinationRequest, Destination, FlakeStatusReply, FlakeStatusRequest, GetPackageRequest, GitCommitReply,
     GitCommitRequest, GitDiffReply, GitDiffRequest, GitSetStagedRequest, GitStatusReply, GitStatusRequest,
     ListDestinationsReply, ListDestinationsRequest, ListInstalledReply, ListInstalledRequest, OperationEvent,
     OperationKind, Package, ProgressEvent, RebuildMode, RebuildRequest, SearchPackagesReply, SearchPackagesRequest,
-    SetConfigPackageReply, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
+    MaintainBootReply, MaintainBootRequest, ScanBootRequest, SetConfigPackageReply, SetConfigPackageRequest,
+    UpdateFlakeRequest, WatchRequest,
 };
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<ProgressEvent, Status>> + Send>>;
@@ -246,6 +248,23 @@ impl NixBackend for Service {
         let target = config::resolve(req.target.as_ref());
         let reply = blocking(move || git::diff(&target.config_dir, &req.path, &req.old_path, req.staged)).await?;
         Ok(Response::new(reply))
+    }
+
+    async fn get_boot_info(&self, _request: Request<BootInfoRequest>) -> Result<Response<BootInfo>, Status> {
+        Ok(Response::new(blocking(|| Ok(boot::info())).await?))
+    }
+
+    async fn scan_boot(&self, _request: Request<ScanBootRequest>) -> Result<Response<BootScan>, Status> {
+        Ok(Response::new(boot::scan().await?))
+    }
+
+    async fn maintain_boot(&self, request: Request<MaintainBootRequest>) -> Result<Response<MaintainBootReply>, Status> {
+        // Pruning the boot menu while a rebuild writes to it would corrupt it,
+        // so this takes the same slot.
+        self.hub.begin(OperationKind::BootMaintenance, RebuildMode::Unspecified)?;
+        let result = boot::maintain(request.into_inner()).await;
+        self.hub.end();
+        Ok(Response::new(result?))
     }
 }
 

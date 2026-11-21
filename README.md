@@ -56,6 +56,24 @@ nix-manager rebuild test             # against a real one
 source <(nix-manager completions zsh)   # zsh tab completion (after compinit)
 ```
 
+## Boot
+
+The hard-drive button opens the boot page: which bootloader the system installs (**r-boot**, **systemd-boot** or **GRUB**, read from the installer script of the running system), how full its partition is, which menu entries and files are on it, and every system generation.
+
+- **Scan partition** lists the files and menu entries and marks kernels and initrds that no entry uses (and half-copied leftovers from failed runs). The partition is root-only, so this asks for authorization (polkit) once; nothing is deleted.
+- **Delete unused files** makes room without touching the menu. Use it when a rebuild fails with “No space left on device”: installers copy the new kernel before they remove old ones.
+- **Prune** and the trash button delete old generations and reinstall the bootloader (`switch-to-configuration boot`), which rewrites the menu from what is left. The current and the booted generation are never deleted. Store paths stay until the next garbage collection.
+
+The same from the shell:
+
+```sh
+nix-manager boot                # loader, usage, generations
+nix-manager boot scan           # entries and files, unused ones marked
+nix-manager boot clean          # delete the unused files
+nix-manager boot prune --keep 5 # delete older generations, rewrite the menu
+nix-manager boot reinstall
+```
+
 ## Assistant
 
 The sparkles button opens a chat with an AI agent that can explain the configuration or change it. The agent is any program that speaks the [Agent Client Protocol](https://agentclientprotocol.com) on its standard input and output; set the command in Settings (default `claude-code-acp`; others include `codex-acp` and `gemini --experimental-acp`).

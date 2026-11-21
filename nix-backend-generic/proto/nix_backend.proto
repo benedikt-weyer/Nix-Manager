@@ -73,6 +73,20 @@ service NixBackend {
 
     // The changes to one file as a unified diff.
     rpc GitDiff(GitDiffRequest) returns (GitDiffReply);
+
+    // Which bootloader the running system installs, how full its partition is
+    // and which system generations exist. Needs no privileges.
+    rpc GetBootInfo(BootInfoRequest) returns (BootInfo);
+
+    // Lists what is on the boot partition and which of it the loader's menu
+    // still uses. The partition is usually readable by root only, so this asks
+    // for authorization (polkit) unless the user can read it anyway.
+    rpc ScanBoot(ScanBootRequest) returns (BootScan);
+
+    // Frees space on the boot partition and prunes its menu, under a single
+    // authorization. Takes the operation slot, so it is rejected while an
+    // update or rebuild runs (and the other way round).
+    rpc MaintainBoot(MaintainBootRequest) returns (MaintainBootReply);
 }
 
 // Only one UpdateFlake/Rebuild runs at a time per backend. Starting another
@@ -212,6 +226,8 @@ enum OperationKind {
     OPERATION_KIND_UNSPECIFIED = 0;
     UPDATE_FLAKE = 1;
     REBUILD = 2;
+    // Only holds the operation slot; never streamed through Watch.
+    BOOT_MAINTENANCE = 3;
 }
 
 // A ProgressEvent tagged with the operation it belongs to, so a client that
@@ -428,4 +444,123 @@ message GitDiffReply {
     string text = 1;
     // The diff was cut off because it is too large.
     bool truncated = 2;
+}
+
+// --------------------------------------------------------------- boot --
+
+enum Bootloader {
+    BOOTLOADER_UNKNOWN = 0;
+    BOOTLOADER_R_BOOT = 1;
+    BOOTLOADER_SYSTEMD_BOOT = 2;
+    BOOTLOADER_GRUB = 3;
+}
+
+message BootInfoRequest {}
+
+// One system generation: an entry of /nix/var/nix/profiles/system.
+message BootGeneration {
+    uint64 number = 1;
+    string store_path = 2;
+    // e.g. "NixOS 26.11.20261121.2786a2a (Linux 6.18.64)"
+    string label = 3;
+    // When the generation was registered, seconds since the epoch.
+    int64 created_unix = 4;
+    // The one the system profile points at, so the next boot's default.
+    bool current = 5;
+    // The one the machine was booted into.
+    bool booted = 6;
+    // The one that is activated right now.
+    bool running = 7;
+    // The kernel and initrd in the Nix store, which the bootloader copies
+    // (or, for some setups, points at).
+    string kernel = 8;
+    string initrd = 9;
+    // Their sizes together.
+    uint64 boot_bytes = 10;
+}
+
+message BootInfo {
+    Bootloader bootloader = 1;
+    // The script that installs the bootloader on every rebuild; empty when it
+    // could not be found.
+    string installer = 2;
+    string mount_point = 3;
+    // False when the mount point is only a directory on another file system
+    // (usually the root one); the sizes then describe that file system.
+    bool is_mount = 4;
+    string device = 5;
+    string fs_type = 6;
+    uint64 total_bytes = 7;
+    uint64 used_bytes = 8;
+    uint64 free_bytes = 9;
+    // The partition can be listed without authorization.
+    bool listable = 10;
+    // How many older generations the bootloader keeps besides the current one;
+    // 0 when that is not known.
+    uint32 generation_limit = 11;
+    // Where the loader keeps kernels and initrds, relative to the mount point;
+    // empty when it keeps none there.
+    string kernel_dir = 12;
+    // Newest first.
+    repeated BootGeneration generations = 13;
+}
+
+message ScanBootRequest {}
+
+enum BootFileState {
+    // Not something the loader's menu manages (the loader itself, its
+    // configuration, other systems).
+    BOOT_FILE_STATE_OTHER = 0;
+    // A kernel or initrd some menu entry uses.
+    BOOT_FILE_STATE_IN_USE = 1;
+    // A kernel or initrd no menu entry uses: safe to delete.
+    BOOT_FILE_STATE_STALE = 2;
+    // A copy that was never finished, left behind by a failed run.
+    BOOT_FILE_STATE_PARTIAL = 3;
+}
+
+message BootFile {
+    // Relative to the mount point.
+    string path = 1;
+    uint64 size = 2;
+    int64 modified_unix = 3;
+    BootFileState state = 4;
+    // Ids of the menu entries that use it.
+    repeated string used_by = 5;
+}
+
+message BootEntry {
+    string id = 1;
+    string title = 2;
+    // The system generation it boots; 0 when that is not known.
+    uint64 generation = 3;
+    bool is_default = 4;
+    // The files it loads from the partition, relative to the mount point.
+    repeated string files = 5;
+}
+
+message BootScan {
+    // The partition was read with authorization.
+    bool elevated = 1;
+    // Largest first.
+    repeated BootFile files = 2;
+    repeated BootEntry entries = 3;
+}
+
+message MaintainBootRequest {
+    // Files to delete, relative to the mount point. Only kernels and initrds
+    // directly inside the loader's kernel directory are accepted.
+    repeated string delete_files = 1;
+    // System generations to delete. The current and the booted one are refused.
+    // Deleting generations always reinstalls the bootloader, so that their
+    // menu entries go away too.
+    repeated uint64 delete_generations = 2;
+    // Run the bootloader installer again (`switch-to-configuration boot`),
+    // which rewrites the menu from the generations that are left.
+    bool reinstall = 3;
+}
+
+message MaintainBootReply {
+    // What the privileged steps printed.
+    string output = 1;
 }

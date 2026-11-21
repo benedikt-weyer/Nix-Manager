@@ -142,7 +142,7 @@ async fn switch_phase(tx: &EventTx, phase: &AtomicI32, payload: &str) {
     }
 }
 
-fn find_in_path(name: &str) -> Option<String> {
+pub(crate) fn find_in_path(name: &str) -> Option<String> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).map(|dir| dir.join(name)).find(|candidate| candidate.is_file()).map(|p| p.to_string_lossy().into_owned())
 }
@@ -298,7 +298,7 @@ pub async fn update_flake(target: &ResolvedTarget, cancel: &Cancel, tx: EventTx)
 /// a sandboxed terminal or editor) the kernel ignores setuid bits, so the
 /// pkexec wrapper can never elevate: it just prints "pkexec must be setuid
 /// root". Detect that up front instead of after a long build.
-fn no_new_privs() -> bool {
+pub(crate) fn no_new_privs() -> bool {
     std::fs::read_to_string("/proc/self/status")
         .map(|status| status.lines().any(|line| line.strip_prefix("NoNewPrivs:").is_some_and(|v| v.trim() == "1")))
         .unwrap_or(false)

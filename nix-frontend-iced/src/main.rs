@@ -1,4 +1,5 @@
 mod ai;
+mod boot;
 mod fx;
 mod git;
 mod inbox;
@@ -15,11 +16,12 @@ use iced::widget::text_editor;
 use iced::{window, Subscription, Task};
 use nix_backend_client::settings::{self, Settings};
 use nix_backend_client::{
-    BuildItem, BuildStats, Client, Destination, EventPhase, FlakeStatusReply, GitCommitReply, GitDiffReply,
+    BootInfo, BootScan, BuildItem, BuildStats, Client, MaintainBootReply, Destination, EventPhase, FlakeStatusReply, GitCommitReply, GitDiffReply,
     GitStatusReply, OperationKind, Package, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
 };
 
 use ai::Ai;
+use boot::{Ask, Boot};
 use fx::{Fx, Slot};
 use git::{Diff, Git, Selected};
 use inbox::{End, Inbox, Segment};
@@ -101,6 +103,7 @@ pub enum Page {
     Settings,
     Store,
     Git,
+    Boot,
     Ai,
 }
 
@@ -211,6 +214,7 @@ pub struct App {
     pub copied: Option<CopyTarget>,
     pub store: Store,
     pub git: Git,
+    pub boot: Boot,
     pub ai: Ai,
     pub fx: Fx,
     last_frame: Option<Instant>,
@@ -290,6 +294,21 @@ pub enum Message {
     GitCommit,
     GitCommitted(SystemTarget, Result<GitCommitReply, String>),
     GitDismissBanner,
+    OpenBoot,
+    BootBack,
+    BootReload,
+    BootInfoLoaded(Result<BootInfo, String>),
+    BootScan,
+    BootScanned(Result<BootScan, String>),
+    BootKeep(usize),
+    /// Asks the user to confirm before something is deleted.
+    BootAsk(Ask),
+    BootCancelAsk,
+    BootConfirm,
+    BootReinstall,
+    /// What was done, for the banner, and how it went.
+    BootMaintained(String, Result<MaintainBootReply, String>),
+    BootDismissBanner,
     WindowFocused,
     OpenAi,
     AiBack,
@@ -378,6 +397,7 @@ impl App {
             copied: None,
             store: Store::new(),
             git: Git::new(),
+            boot: Boot::new(),
             ai: Ai::new(),
             fx: Fx::new(),
             last_frame: None,
@@ -496,6 +516,7 @@ impl App {
             self.busy()
                 || self.store.busy()
                 || self.git.busy()
+                || self.boot.busy()
                 || self.ai.working()
                 || matches!(self.conn, Conn::Connecting),
         );
@@ -1010,13 +1031,11 @@ impl App {
             }
             Message::GitReload => self.load_git(),
             // Coming back to the window is when files edited elsewhere need to show up.
-            Message::WindowFocused => {
-                if self.page == Page::Git && !self.git.working {
-                    self.load_git()
-                } else {
-                    Task::none()
-                }
-            }
+            Message::WindowFocused => match self.page {
+                Page::Git if !self.git.working => self.load_git(),
+                Page::Boot if !self.boot.working => self.load_boot(),
+                _ => Task::none(),
+            },
             Message::GitLoaded(requested, result) => {
                 if requested != self.target() {
                     return Task::none();
@@ -1127,6 +1146,112 @@ impl App {
                 self.git.banner = None;
                 Task::none()
             }
+            Message::OpenBoot => {
+                self.show(Page::Boot);
+                self.load_boot()
+            }
+            Message::BootBack => {
+                self.show(Page::Dashboard);
+                Task::none()
+            }
+            Message::BootReload => self.load_boot(),
+            Message::BootInfoLoaded(result) => {
+                self.boot.refreshing = false;
+                match result {
+                    Ok(info) => self.boot.set_info(info),
+                    // Keep showing what we had if there is something.
+                    Err(error) if self.boot.info.ready().is_some() => {
+                        self.boot.banner = Some(Banner { text: error, error: true, action: None });
+                    }
+                    Err(error) => self.boot.info = Load::Failed(error),
+                }
+                Task::none()
+            }
+            Message::BootScan => {
+                let Some(mut client) = self.client().filter(|_| !self.boot.scan.loading() && !self.boot.working) else {
+                    return Task::none();
+                };
+                self.boot.scan = Load::Loading;
+                self.boot.banner = None;
+                self.boot.ask = None;
+                Task::perform(
+                    async move { client.scan_boot().await.map_err(status_text) },
+                    Message::BootScanned,
+                )
+            }
+            Message::BootScanned(result) => {
+                match result {
+                    Ok(scan) => self.boot.scan = Load::Ready(scan),
+                    // The earlier scan stays when a newer one fails.
+                    Err(error) if self.boot.scan.ready().is_some() => {
+                        self.boot.banner = Some(Banner { text: error, error: true, action: None });
+                    }
+                    Err(error) => self.boot.scan = Load::Failed(error),
+                }
+                Task::none()
+            }
+            Message::BootKeep(keep) => {
+                self.boot.set_keep(keep);
+                Task::none()
+            }
+            Message::BootAsk(ask) => {
+                self.boot.ask = Some(ask);
+                Task::none()
+            }
+            Message::BootCancelAsk => {
+                self.boot.ask = None;
+                Task::none()
+            }
+            Message::BootConfirm => {
+                let Some(ask) = self.boot.ask.clone() else {
+                    return Task::none();
+                };
+                let (what, files, generations) = match ask {
+                    Ask::Clean => {
+                        let files: Vec<String> = self
+                            .boot
+                            .scan
+                            .ready()
+                            .map(|scan| scan.junk().map(|file| file.path.clone()).collect())
+                            .unwrap_or_default();
+                        (format!("Deleted {} unused file(s)", files.len()), files, Vec::new())
+                    }
+                    Ask::Prune => {
+                        let generations = self.boot.prunable();
+                        (format!("Deleted {} generation(s)", generations.len()), Vec::new(), generations)
+                    }
+                    Ask::Generation(number) => (format!("Deleted generation {number}"), Vec::new(), vec![number]),
+                };
+                self.maintain_boot(what, files, generations, false)
+            }
+            Message::BootReinstall => {
+                self.maintain_boot("Reinstalled the bootloader".to_owned(), Vec::new(), Vec::new(), true)
+            }
+            Message::BootMaintained(what, result) => {
+                self.boot.working = false;
+                match result {
+                    Ok(reply) => {
+                        self.boot.banner = Some(Banner { text: what, error: false, action: None });
+                        self.boot.output = Some(reply.output);
+                    }
+                    Err(error) => {
+                        self.boot.banner = Some(Banner {
+                            text: "The boot partition was not changed completely. See the output below.".to_owned(),
+                            error: true,
+                            action: None,
+                        });
+                        self.boot.output = Some(error);
+                    }
+                }
+                // What was scanned is out of date now; scanning again asks for authorization again.
+                self.boot.scan = Load::Idle;
+                self.load_boot()
+            }
+            Message::BootDismissBanner => {
+                self.boot.banner = None;
+                self.boot.output = None;
+                Task::none()
+            }
             Message::OpenAi => {
                 self.show(Page::Ai);
                 if matches!(self.ai.phase, ai::Phase::Idle) {
@@ -1199,6 +1324,37 @@ impl App {
             events.filter_map(move |event| {
                 futures::future::ready(mailbox.push(event).then_some(Message::AiWake(session)))
             }),
+        )
+    }
+
+    fn load_boot(&mut self) -> Task<Message> {
+        let Some(mut client) = self.client() else {
+            return Task::none();
+        };
+        // What is shown stays while it is read again.
+        if self.boot.info.ready().is_some() {
+            self.boot.refreshing = true;
+        } else {
+            self.boot.info = Load::Loading;
+        }
+        Task::perform(async move { client.boot_info().await.map_err(status_text) }, Message::BootInfoLoaded)
+    }
+
+    /// Deletes files and generations and/or reinstalls the bootloader, under one authorization.
+    fn maintain_boot(&mut self, what: String, files: Vec<String>, generations: Vec<u64>, reinstall: bool) -> Task<Message> {
+        let Some(mut client) = self.client().filter(|_| !self.boot.working) else {
+            return Task::none();
+        };
+        self.boot.working = true;
+        self.boot.ask = None;
+        self.boot.banner = None;
+        self.boot.output = None;
+        Task::perform(
+            async move {
+                let result = client.maintain_boot(files, generations, reinstall).await.map_err(status_text);
+                (what, result)
+            },
+            |(what, result)| Message::BootMaintained(what, result),
         )
     }
 
@@ -1357,7 +1513,10 @@ impl App {
                 let installed = if self.page == Page::Store { self.load_installed() } else { Task::none() };
                 // An update rewrites flake.lock.
                 let git = if self.page == Page::Git { self.load_git() } else { Task::none() };
-                Task::batch([self.load_status(), installed, git])
+                // A rebuild writes to the boot partition.
+                self.boot.scan = Load::Idle;
+                let boot = if self.page == Page::Boot { self.load_boot() } else { Task::none() };
+                Task::batch([self.load_status(), installed, git, boot])
             }
             Some(End::Failed(message)) => {
                 run.outcome = Outcome::Failed(message);
@@ -1378,7 +1537,7 @@ impl App {
         if self.fx.animating() || self.inbox.has_pending() {
             subscriptions.push(window::frames().map(Message::Frame));
         }
-        if self.page == Page::Git {
+        if matches!(self.page, Page::Git | Page::Boot) {
             subscriptions.push(iced::event::listen_with(|event, _, _| match event {
                 iced::Event::Window(window::Event::Focused) => Some(Message::WindowFocused),
                 _ => None,

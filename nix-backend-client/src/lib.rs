@@ -23,6 +23,7 @@ pub mod proto {
 pub mod diff;
 
 pub use proto::{
+    BootEntry, BootFile, BootFileState, BootGeneration, BootInfo, BootScan, Bootloader, MaintainBootReply,
     BuildItem, BuildItemKind, BuildItemStatus, BuildStats, Destination, EventPhase, FlakeStatusReply, GitChange,
     GitCommitReply, GitDiffReply, GitFile, GitStatusReply, Maintainer, OperationEvent, OperationKind, Package,
     PackageSummary, ProgressEvent, RebuildMode, SearchPackagesReply, SetConfigPackageReply, SystemTarget,
@@ -30,7 +31,7 @@ pub use proto::{
 
 use proto::nix_backend_client::NixBackendClient;
 use proto::{
-    CancelOperationRequest, CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest, GitCommitRequest,
+    BootInfoRequest, MaintainBootRequest, ScanBootRequest, CancelOperationRequest, CreateDestinationRequest, FlakeStatusRequest, GetPackageRequest, GitCommitRequest,
     GitDiffRequest,
     GitSetStagedRequest, GitStatusRequest, ListDestinationsRequest, ListInstalledRequest, RebuildRequest,
     SearchPackagesRequest, SetConfigPackageRequest, UpdateFlakeRequest, WatchRequest,
@@ -62,6 +63,87 @@ impl GitFile {
         let mut paths = vec![self.path.clone()];
         paths.extend((!self.old_path.is_empty()).then(|| self.old_path.clone()));
         paths
+    }
+}
+
+impl BootInfo {
+    pub fn loader(&self) -> Bootloader {
+        Bootloader::try_from(self.bootloader).unwrap_or(Bootloader::Unknown)
+    }
+
+    /// Whether the partition has a share of the data we can show.
+    pub fn has_usage(&self) -> bool {
+        self.total_bytes > 0
+    }
+
+    /// How much of the partition is used, 0..=1.
+    pub fn used_fraction(&self) -> f32 {
+        if self.total_bytes == 0 {
+            0.0
+        } else {
+            (self.used_bytes as f64 / self.total_bytes as f64).clamp(0.0, 1.0) as f32
+        }
+    }
+
+    /// The most generations the bootloader shows: the older ones it keeps plus
+    /// the current one. `None` when that isn't known.
+    pub fn menu_size(&self) -> Option<usize> {
+        (self.generation_limit > 0).then(|| self.generation_limit as usize + 1)
+    }
+}
+
+impl Bootloader {
+    /// How the loader is called in the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Bootloader::RBoot => "r-boot",
+            Bootloader::SystemdBoot => "systemd-boot",
+            Bootloader::Grub => "GRUB",
+            Bootloader::Unknown => "Unknown bootloader",
+        }
+    }
+}
+
+impl BootFile {
+    pub fn file_state(&self) -> BootFileState {
+        BootFileState::try_from(self.state).unwrap_or(BootFileState::Other)
+    }
+
+    /// Whether deleting the file is safe: nothing in the boot menu uses it.
+    pub fn is_junk(&self) -> bool {
+        matches!(self.file_state(), BootFileState::Stale | BootFileState::Partial)
+    }
+
+    /// The file name, without the directory.
+    pub fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+}
+
+impl BootScan {
+    /// The files that can go without affecting any menu entry.
+    pub fn junk(&self) -> impl Iterator<Item = &BootFile> {
+        self.files.iter().filter(|file| file.is_junk())
+    }
+
+    pub fn junk_bytes(&self) -> u64 {
+        self.junk().map(|file| file.size).sum()
+    }
+}
+
+impl BootGeneration {
+    /// The generation the machine would boot or is running now: it can't be deleted.
+    pub fn is_protected(&self) -> bool {
+        self.current || self.booted
+    }
+}
+
+impl BootInfo {
+    /// The numbers of the generations that fall outside the `keep` newest ones,
+    /// leaving out any that is protected (the current and the booted system).
+    pub fn prunable(&self, keep: usize) -> Vec<u64> {
+        // `generations` is newest first.
+        self.generations.iter().skip(keep).filter(|generation| !generation.is_protected()).map(|g| g.number).collect()
     }
 }
 
@@ -203,6 +285,33 @@ impl Client {
         let request =
             GitDiffRequest { target: Some(target), path: file.path.clone(), old_path: file.old_path.clone(), staged };
         Ok(self.inner.git_diff(request).await?.into_inner())
+    }
+
+    /// The bootloader the running system installs, how full its partition is
+    /// and the system generations. Needs no authorization.
+    pub async fn boot_info(&mut self) -> Result<BootInfo, Status> {
+        Ok(self.inner.get_boot_info(BootInfoRequest {}).await?.into_inner())
+    }
+
+    /// What is on the boot partition and which of it the boot menu uses. Asks
+    /// for authorization when the partition can't be read as the user.
+    pub async fn scan_boot(&mut self) -> Result<BootScan, Status> {
+        Ok(self.inner.scan_boot(ScanBootRequest {}).await?.into_inner())
+    }
+
+    /// Deletes `delete_files` from the boot partition and `delete_generations`
+    /// from the system profile, and (`reinstall`, or whenever generations are
+    /// deleted) reinstalls the bootloader so its menu follows. One
+    /// authorization. Fails with `FAILED_PRECONDITION` while an update or
+    /// rebuild runs.
+    pub async fn maintain_boot(
+        &mut self,
+        delete_files: Vec<String>,
+        delete_generations: Vec<u64>,
+        reinstall: bool,
+    ) -> Result<MaintainBootReply, Status> {
+        let request = MaintainBootRequest { delete_files, delete_generations, reinstall };
+        Ok(self.inner.maintain_boot(request).await?.into_inner())
     }
 
     /// Every event of every operation, whoever started it. Frontends should
