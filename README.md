@@ -93,7 +93,7 @@ nix-manager boot signing remove
 
 ## Assistant
 
-The sparkles button opens a chat with an AI agent that can explain the configuration or change it. The agent is any program that speaks the [Agent Client Protocol](https://agentclientprotocol.com) on its standard input and output; set the command in Settings (default `claude-code-acp`; others include `codex-acp` and `gemini --experimental-acp`).
+The sparkles button opens a chat with an AI agent that can explain the configuration or change it. The agent is any program that speaks the [Agent Client Protocol](https://agentclientprotocol.com) on its standard input and output; set the command in Settings (default `claude-agent-acp`; others include `codex-acp` and `gemini --experimental-acp`).
 
 It runs as you, in the config directory, and starts when the page is first opened. It asks before it edits files or runs commands, and nothing is ever allowed on your behalf. Its edits land in the files like any other change, so review and commit them on the git page. It is told not to rebuild or commit itself.
 

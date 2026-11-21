@@ -416,7 +416,7 @@ fn settings(app: &App) -> Element<'_, Message> {
                 &app.draft_agent,
                 Message::DraftAgentChanged
             ),
-            text("Any agent that speaks the Agent Client Protocol, such as claude-code-acp, codex-acp or `gemini --experimental-acp`. It runs as you, in the config directory.")
+            text("Any agent that speaks the Agent Client Protocol, such as claude-agent-acp, codex-acp or `gemini --experimental-acp`. It runs as you, in the config directory.")
                 .size(12)
                 .color(MUTED),
             field(

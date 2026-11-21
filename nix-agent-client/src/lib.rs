@@ -2,7 +2,7 @@
 //! configuration, over the [Agent Client Protocol](https://agentclientprotocol.com).
 //!
 //! The agent is a program of the user's choosing that speaks ACP on its
-//! standard input and output (for example `claude-code-acp`). [`start`] runs
+//! standard input and output (for example `claude-agent-acp`). [`start`] runs
 //! it in the configuration directory and gives back a [`Handle`] to send
 //! prompts with and a stream of [`Event`]s to show.
 //!
@@ -47,7 +47,7 @@ fn briefing(config_dir: &str, host: &str) -> String {
 }
 
 pub struct Config {
-    /// The command that starts the agent, e.g. `claude-code-acp` or
+    /// The command that starts the agent, e.g. `claude-agent-acp` or
     /// `gemini --experimental-acp`.
     pub command: String,
     /// The configuration directory; the agent works in it.

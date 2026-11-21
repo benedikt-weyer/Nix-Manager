@@ -13,7 +13,7 @@ pub const DEFAULT_EDITOR: &str = "zed";
 
 /// The AI agent that is started unless another is set. It must speak the
 /// Agent Client Protocol on its standard input and output.
-pub const DEFAULT_AGENT: &str = "claude-code-acp";
+pub const DEFAULT_AGENT: &str = "claude-agent-acp";
 
 /// Arguments for `nix build` unless others are set. They make a rebuild
 /// survive a flaky connection to the binary cache: fewer parallel downloads,
@@ -34,7 +34,7 @@ pub struct Settings {
     #[serde(default)]
     pub editor: String,
     /// A command line that starts an Agent Client Protocol agent, e.g.
-    /// `claude-code-acp` or `gemini --experimental-acp`.
+    /// `claude-agent-acp` or `gemini --experimental-acp`.
     #[serde(default)]
     pub agent: String,
     /// Extra arguments for `nix build` when rebuilding, as a command line.

@@ -422,7 +422,7 @@ fn unavailable<'a>(app: &'a App, reason: &str) -> Element<'a, Message> {
                 text(format!("Command: {}", app.effective_agent())).size(13).font(Font::MONOSPACE),
                 text(
                     "Nix Manager starts an AI agent that speaks the Agent Client Protocol. Install one \
-                     (for example claude-code-acp) and make sure it is on your PATH, or set the command to use in Settings.",
+                     (for example claude-agent-acp) and make sure it is on your PATH, or set the command to use in Settings.",
                 )
                 .size(13)
                 .color(MUTED),
